@@ -32,6 +32,7 @@ st.set_page_config(
     page_title="Smart City Dynamic Dispatch Grid",
     page_icon="🚑",
     layout="wide",
+    initial_sidebar_state="collapsed",
 )
 
 st.title("🚨 Smart City Dynamic Dispatch Grid")
@@ -331,42 +332,6 @@ def choose_vehicle(incident_type: str, location: str, graph: nx.Graph, available
     minutes, vehicle = min(scored, key=lambda item: item[0])
     return vehicle, minutes
 
-def draw_map(incidents: list[dict], assignments: list[dict], closures_rows: list[int], closures_cols: list[int]):
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(9, 7))
-    ax.set_xlim(-0.5, GRID_SIZE - 0.5)
-    ax.set_ylim(-0.5, GRID_SIZE - 0.5)
-    ax.set_xticks(range(GRID_SIZE))
-    ax.set_yticks(range(GRID_SIZE))
-    ax.grid(True, alpha=0.18)
-    ax.set_xlabel("Grid X")
-    ax.set_ylabel("Grid Y")
-    ax.set_title("Simulated city grid (not a real geographic map)")
-    # Landmarks
-    for name, (x, y) in LANDMARKS.items():
-        ax.scatter(x, y, marker="s", s=35)
-        ax.annotate(name, (x, y), fontsize=6, xytext=(3, 3), textcoords="offset points")
-    # Vehicle stations
-    for v in VEHICLES:
-        x, y = v["Station"]
-        ax.scatter(x, y, marker="^", s=48)
-    # Incidents
-    for inc in incidents:
-        if inc.get("is_emergency"):
-            if inc.get("location") not in LANDMARKS:
-                continue                                    # unknown location: not drawn on the map
-            x, y = LANDMARKS[inc["location"]]
-            ax.scatter(x, y, marker="X", s=90)
-    for y in closures_rows:
-        ax.axhline(y, linewidth=2, linestyle="--", alpha=0.55)
-    for x in closures_cols:
-        ax.axvline(x, linewidth=2, linestyle="--", alpha=0.55)
-    ax.text(0.01, -0.13, "Squares = landmarks | Triangles = vehicle stations | X = emergency incidents | Dashed lines = simulated closures",
-            transform=ax.transAxes, fontsize=8)
-    fig.tight_layout()
-    return fig
-
-
 SEV_COLOR = {5: "#D62839", 4: "#E46A1E", 3: "#D9A21B", 2: "#86AE3A", 1: "#8A97A5"}
 
 
@@ -550,17 +515,6 @@ def run_triage(call_text: str) -> tuple[dict, list[tuple[str, str]]]:
 
 # ----------------------- Triage helpers: duplicates, records, one-click dispatch -----------------------
 COMPATIBLE_TYPES = {"Fire": {"Fire", "Medical"}, "Rescue": {"Rescue", "Medical"}, "Medical": {"Medical", "Fire", "Rescue"}}
-SAMPLE_CALLS = [
-    "Caller reports a serious road accident with two injured people near Central Hospital.",
-    "Smoke and flames are coming from a building near the Shopping Mall.",
-    "Second caller: big fire at the shopping mall, people are shouting, the smoke is getting worse.",
-    "A person is unconscious and not breathing near Railway Station.",
-    "Several people are trapped after a building collapse in the Industrial Area.",
-    "Water is rising fast near the river bank, an old man is stuck on the roof.",
-    "My mother fell in the kitchen and is bleeding badly, please hurry.",
-    "Strong gas smell near the petrol pump, nobody hurt yet.",
-    "This is a prank call; there is no emergency.",
-]
 
 
 def _words(t: str) -> set[str]:
@@ -599,65 +553,6 @@ def add_call(text: str, triage: dict, source: str, engine: str | None = None, au
             original["severity"] = int(rec["severity"])
     st.session_state.calls.append(rec)
     return rec
-
-
-def send_vehicle_now(rec: dict) -> tuple[bool, str]:
-    """One-click dispatch for one call, with the same rules as the dispatch board."""
-    target = rec
-    if rec.get("duplicate_of"):
-        target = next((c for c in st.session_state.calls if c["Call ID"] == rec["duplicate_of"]), rec)
-    if target.get("Help vehicle"):
-        return False, f"{target['Help vehicle']} is already on its way to {target['Call ID']}."
-    if not target.get("location"):
-        return False, "No location yet: call the reporter back first."
-    graph = add_closures(make_city_graph(), closure_rows, closure_cols)
-    available = [v for v in VEHICLES if v["Vehicle ID"] not in st.session_state.used_vehicle_ids]
-    vehicle, minutes = choose_vehicle(target["incident_type"], target["location"], graph, available)
-    if vehicle is None:
-        return False, "No suitable vehicle is free or reachable right now."
-    st.session_state.used_vehicle_ids.add(vehicle["Vehicle ID"])
-    target["Help vehicle"] = vehicle["Vehicle ID"]
-    return True, f"{vehicle['Vehicle ID']} ({vehicle['Type'].lower()}) sent to {target['location']}, about {minutes:.0f} simulated minutes away."
-
-
-def call_actions(rec: dict) -> None:
-    """What the dispatcher can do next: see which departments the router chose, and send to all of them."""
-    if rec.get("duplicate_of"):
-        st.info(f"🔁 Probably the same incident as **{rec['duplicate_of']}** (same place, compatible type, "
-                f"similarity {rec['duplicate_score']:.0%}). It was joined to it, so no extra team is needed.")
-    if not rec.get("is_emergency"):
-        return
-    target = rec if not rec.get("duplicate_of") else next((c for c in st.session_state.calls if c["Call ID"] == rec["duplicate_of"]), rec)
-    if target.get("assignments"):
-        st.markdown("**Teams alerted**  \n" + teams_html(target["assignments"]), unsafe_allow_html=True)
-        return
-    preview = route_problem(rec["Call text"], rec)
-    with st.container(border=True):
-        st.markdown("**🔀 Router agent suggests**  \n" + " ".join(
-            f"{DEPARTMENTS[t_['dept']]['icon']} **{t_['dept']}** <span style='opacity:.7'>({t_['role']}: {t_['why']})</span><br>"
-            for t_ in preview["teams"]), unsafe_allow_html=True)
-        if preview["review"]:
-            st.caption("🧑‍💼 Supervisor check: " + "; ".join(preview["review"]))
-        if st.button("📡 Send to these departments", key=f"send_{rec['Call ID']}", type="primary", disabled=not target.get("location")):
-            run_ = run_agents(target["Call text"], target, target["Call ID"], target.get("Source", "Typed"))
-            target["assignments"] = run_["assignments"]
-            target["teams"] = [a_["dept"] for a_ in run_["assignments"]]
-            first = next((a_ for a_ in run_["assignments"] if a_.get("unit")), None)
-            if first:
-                target["Help vehicle"] = first["unit"]
-            st.rerun()
-        if not target.get("location"):
-            st.caption("Set the location after a call-back to enable dispatch.")
-
-
-def source_of(text: str, sample: str | None) -> tuple[str, str | None, bytes | None]:
-    """Where the transcript came from, decided when it is triaged (forms cannot use change callbacks)."""
-    vtext, vaudio = st.session_state.get("voice_text"), st.session_state.get("call_audio")
-    if vaudio and vtext:
-        return ("Voice" if text.strip() == vtext.strip() else "Voice, edited"), st.session_state.get("call_engine"), vaudio
-    if sample and text.strip() == sample.strip():
-        return "Sample", None, None
-    return "Typed", None, None
 
 
 # ----------------------- Multi-agent routing: the right problem goes to the right team -----------------------
@@ -900,277 +795,6 @@ digraph G {
   triage -> sup [style=dashed, label="unsure"]; router -> sup [style=dashed, label="unclear"];
 }
 """
-
-
-# ----------------------- Emergency call: a spoken conversation with a call-taker agent -----------------------
-# Like a 112 / 911 call-taker: ask what happened and where, send help as soon as both are known, keep asking the
-# questions of that problem's protocol (breathing? trapped? weapon?), raise urgency when the answers demand it,
-# alert extra departments when new problems appear, and give life-saving instructions while help is on the way.
-CALL_Q = {   # slot -> (English, Hindi)
-    "problem": ("112, what is your emergency? Tell me what is happening.",
-                "112, आपकी आपात स्थिति क्या है? बताइए क्या हो रहा है।"),
-    "problem_again": ("I need to understand what happened. Is it a fire, an accident, someone ill or hurt, a crime, a building collapse, "
-                      "a flood, a gas leak or a fallen electric wire?",
-                      "मुझे समझना है क्या हुआ। आग, दुर्घटना, कोई बीमार या घायल, अपराध, इमारत गिरना, बाढ़, गैस लीक या बिजली का तार?"),
-    "location": ("Where are you? Tell me the nearest landmark, like a hospital, station, market, temple or mall.",
-                 "आप कहाँ हैं? पास की कोई जगह बताइए, जैसे अस्पताल, स्टेशन, बाज़ार, मंदिर या मॉल।"),
-    "location_again": ("I could not find that place. Which landmark is closest? You can also pick it from the list.",
-                       "मुझे वह जगह नहीं मिली। सबसे पास कौन सी जगह है? आप सूची से भी चुन सकते हैं।"),
-    "breathing": ("Is the injured person awake and breathing?", "क्या घायल व्यक्ति होश में है और साँस ले रहा है?"),
-    "bleeding": ("Is anyone bleeding heavily?", "क्या किसी का बहुत खून बह रहा है?"),
-    "trapped": ("Is anyone trapped or unable to get out?", "क्या कोई फँसा हुआ है या बाहर नहीं निकल पा रहा?"),
-    "spreading": ("Is the fire spreading, and is anyone still inside?", "क्या आग फैल रही है, और क्या कोई अभी अंदर है?"),
-    "caller_safe": ("Are you in a safe place right now?", "क्या आप अभी सुरक्षित जगह पर हैं?"),
-    "weapon": ("Does anyone have a weapon, like a knife or a gun?", "क्या किसी के पास हथियार है, जैसे चाकू या बंदूक?"),
-    "description": ("Can you describe the person or vehicle: clothes, direction they went, vehicle number?",
-                    "क्या आप व्यक्ति या गाड़ी के बारे में बता सकते हैं: कपड़े, किस तरफ गए, गाड़ी नंबर?"),
-    "child_desc": ("How old is the child, what are they wearing, and where were they last seen?",
-                   "बच्चे की उम्र क्या है, उसने क्या पहना है, और आखिरी बार कहाँ देखा गया?"),
-    "touching_wire": ("Is anyone touching the wire or hurt by it?", "क्या कोई तार को छू रहा है या उससे घायल है?"),
-    "people": ("How many people are hurt or need help?", "कितने लोग घायल हैं या मदद चाहिए?"),
-    "name": ("What is your name, so the team can call you back on this number?", "आपका नाम क्या है, ताकि टीम आपको इसी नंबर पर कॉल कर सके?"),
-}
-PROTOCOL = {   # problem -> the questions a call-taker asks next, in order
-    "medical": ["breathing", "bleeding", "people"], "road_accident": ["breathing", "bleeding", "trapped", "people"],
-    "collapse": ["trapped", "breathing", "people"], "flood": ["trapped", "people"], "fire": ["spreading", "trapped", "people"],
-    "gas_leak": ["caller_safe", "people"], "crime": ["caller_safe", "weapon", "description", "people"],
-    "women_safety": ["caller_safe", "weapon", "description"], "child": ["child_desc", "description"], "electric": ["touching_wire", "people"],
-}
-YES_NO = ["breathing", "bleeding", "trapped", "spreading", "caller_safe", "weapon", "touching_wire"]
-YES_WORDS = ["yes", "yeah", "yep", "haan", "han", "haa", "ji", "sure", "correct", "right", "हाँ", "हां", "जी", "हा"]
-NO_WORDS = ["no", "nope", "nahi", "nahin", "not", "isn't", "isnt", "doesn't", "can't", "नहीं", "नही", "ना"]
-UNSURE = ["don't know", "dont know", "not sure", "no idea", "pata nahi", "पता नहीं", "मालूम नहीं"]
-SAY = {   # fixed phrases (English, Hindi)
-    "sending": ("I am sending {teams} now. {unit} is about {eta} minutes away. Stay on the line.",
-                "मैं अभी {teams} भेज रहा हूँ। {unit} लगभग {eta} मिनट में पहुँचेगी। लाइन पर बने रहिए।"),
-    "extra": ("I have also alerted {teams}.", "मैंने {teams} को भी सूचित कर दिया है।"),
-    "upgraded": ("This is now marked life-threatening and the team has been told.", "इसे अब जानलेवा माना गया है और टीम को बता दिया गया है।"),
-    "queued": ("All suitable units are busy; you are first in the queue.", "सभी गाड़ियाँ व्यस्त हैं; आप कतार में सबसे आगे हैं।"),
-    "done": ("Help is on the way. Tell me if anything changes, or press End call.",
-             "मदद रास्ते में है। अगर कुछ बदले तो बताइए, या कॉल खत्म करें दबाइए।"),
-    "not_heard": ("Sorry, I did not catch that. Please say it again, or type it.", "माफ़ कीजिए, मैं सुन नहीं पाया। कृपया फिर से बोलिए या लिखिए।"),
-    "ended": ("Thank you. Your reference is {ref}. Help is on the way.", "धन्यवाद। आपका संदर्भ {ref} है। मदद रास्ते में है।"),
-}
-INSTRUCT = {   # life-saving instructions triggered by an answer (English, Hindi)
-    "not_breathing": ("If you are trained, start CPR now: push hard and fast in the centre of the chest. If not, stay with them; "
-                      "the ambulance crew is coming.", "अगर आपको आता है तो अभी CPR शुरू करें: छाती के बीच में तेज़ और ज़ोर से दबाएँ। "
-                      "नहीं तो उनके साथ रहें; एम्बुलेंस आ रही है।"),
-    "bleeding": ("Press firmly on the wound with a clean cloth and keep pressing.", "घाव पर साफ़ कपड़े से ज़ोर से दबाएँ और दबाए रखें।"),
-    "gas": ("Do not switch anything on or off and no flames. Leave the building and wait outside.",
-            "कोई भी स्विच चालू या बंद न करें, कोई आग नहीं। इमारत से बाहर निकलें और बाहर इंतज़ार करें।"),
-    "fire": ("Get everyone out, stay low under smoke, and do not go back inside.", "सबको बाहर निकालें, धुएँ में नीचे झुककर चलें, और वापस अंदर न जाएँ।"),
-    "unsafe": ("Move somewhere safe and lock the door if you can. Do not confront anyone.",
-               "किसी सुरक्षित जगह पर जाएँ और हो सके तो दरवाज़ा बंद कर लें। किसी से उलझें नहीं।"),
-    "wire": ("Do not touch the wire or anyone touching it. Keep everyone at least 10 metres away.",
-             "तार या उसे छूते किसी व्यक्ति को न छुएँ। सबको कम से कम 10 मीटर दूर रखें।"),
-    "trapped": ("Do not go in yourself. Keep talking to them so rescuers can find them.",
-                "खुद अंदर न जाएँ। उनसे बात करते रहें ताकि बचाव दल उन्हें ढूँढ सके।"),
-    "flood": ("Move to higher ground and do not walk or drive through moving water.", "ऊँची जगह पर जाएँ और बहते पानी में न चलें, न गाड़ी चलाएँ।"),
-}
-PROBLEM_HI = {"fire": "आग", "gas_leak": "गैस लीक", "medical": "मेडिकल इमरजेंसी", "road_accident": "सड़क दुर्घटना",
-              "collapse": "इमारत गिरना", "flood": "बाढ़", "crime": "अपराध", "women_safety": "महिला सुरक्षा",
-              "child": "बच्चा खतरे में", "electric": "बिजली का खतरा"}
-TYPE_OF = {"fire": "Fire", "gas_leak": "Fire", "collapse": "Rescue", "flood": "Rescue", "electric": "Rescue", "medical": "Medical",
-           "road_accident": "Medical", "crime": "Police", "women_safety": "Police", "child": "Police"}
-
-
-def _l(pair: tuple[str, str], hindi: bool) -> str:
-    return pair[1] if hindi else pair[0]
-
-
-def yes_no(text: str) -> bool | None:
-    t = " " + re.sub(r"[^\w\u0900-\u097F' ]", " ", text.lower()) + " "
-    if any(u in t for u in UNSURE):
-        return None
-    no = any(f" {w} " in t for w in NO_WORDS)
-    yes = any(f" {w} " in t for w in YES_WORDS)
-    return False if no else True if yes else None
-
-
-def new_call(hindi: bool) -> dict:
-    st.session_state.call_no = st.session_state.get("call_no", 0) + 1
-    return {"ref": f"112-{st.session_state.call_no:03d}", "hindi": hindi, "turns": [], "slots": {}, "asked": [], "pending": "problem",
-            "misses": {}, "dispatched": False, "assignments": [], "severity": 3, "record": None, "ended": False,
-            "started": time.time(), "said_instructions": []}
-
-
-def agent_say(call: dict, text: str) -> None:
-    call["turns"].append({"role": "agent", "text": text, "t": time.strftime("%H:%M:%S")})
-
-
-def caller_text(call: dict) -> str:
-    return ". ".join(t_["text"] for t_ in call["turns"] if t_["role"] == "caller")
-
-
-def extract_into(call: dict, text: str) -> list[str]:
-    """Fill every slot this answer tells us about; returns what changed (used for the acknowledgement)."""
-    sl, got = call["slots"], []
-    t = " " + text.lower() + " "
-    # the answer to the question that was asked
-    pend = call.get("pending")
-    if pend in YES_NO:
-        yn = yes_no(text)
-        if yn is not None:
-            sl[pend] = yn; got.append(pend)
-    elif pend in ("description", "child_desc", "name") and len(text.strip()) > 1 and yes_no(text) is not False:
-        val = text.strip()
-        if pend == "name":
-            m_ = re.search(r"(?:my name is|name is|i am|i'm|this is|mera naam|मेरा नाम)\s+([^\s,.]+)", val, flags=re.I)
-            val = (m_.group(1) if m_ else val.split()[0]).strip().title()
-        sl[pend] = val; got.append(pend)
-    # anything else the caller volunteered
-    probs = [p for p, _ in rule_problems(text)]
-    if probs:
-        before = set(sl.get("problems", []))
-        sl["problems"] = list(dict.fromkeys(sl.get("problems", []) + probs))
-        if set(sl["problems"]) - before:
-            got.append("problems")
-    place = match_location(text)
-    if place and place != sl.get("location"):
-        sl["location"] = place; got.append("location")
-    n = count_people(t)
-    if n and n != sl.get("people"):
-        sl["people"] = n; got.append("people")
-    flags = {"breathing": (["not breathing", "stopped breathing", "unconscious", "not moving", "behosh", "बेहोश", "सांस नहीं", "साँस नहीं"], False),
-             "trapped": (["trapped", "stuck inside", "can't get out", "फंस", "फँस"], True),
-             "bleeding": (["bleeding", "lot of blood", "खून"], True),
-             "spreading": (["spreading", "getting bigger", "फैल"], True),
-             "weapon": (["knife", "gun", "pistol", "weapon", "चाकू", "बंदूक"], True)}
-    for slot, (words, val) in flags.items():
-        if any(w in t for w in words) and sl.get(slot) != val:
-            sl[slot] = val
-            if slot not in got:
-                got.append(slot)
-    return got
-
-
-def call_triage(call: dict) -> dict:
-    """Triage the whole conversation, then let the answers raise the severity (never lower it)."""
-    text = caller_text(call)
-    tri, _ = run_triage(text) if text else ({"severity": 3}, [])
-    sl = call["slots"]
-    sev = int(tri.get("severity", 3))
-    if sl.get("breathing") is False or sl.get("trapped") is True:
-        sev = 5
-    elif any(sl.get(k) is True for k in ("bleeding", "spreading", "weapon", "touching_wire")) or sl.get("caller_safe") is False:
-        sev = max(sev, 4)
-    if (sl.get("people") or 0) >= 3 and sev >= 4:
-        sev = 5
-    probs = sl.get("problems", [])
-    tri.update(is_emergency=True, severity=sev, location=sl.get("location"), people=sl.get("people"),
-               incident_type=TYPE_OF.get(probs[0], tri.get("incident_type", "Medical")) if probs else tri.get("incident_type", "Medical"),
-               severity_reason=", ".join(k.replace("_", " ") + (" yes" if v is True else " no") for k, v in sl.items()
-                                         if k in YES_NO and v is not None) or tri.get("severity_reason", ""))
-    return tri
-
-
-def next_question(call: dict) -> str | None:
-    sl, asked = call["slots"], call["asked"]
-    if not sl.get("problems"):
-        return "problem_again" if "problem_again" not in asked and call["turns"] and any(t_["role"] == "caller" for t_ in call["turns"]) else (
-            None if "problem_again" in asked else "problem")
-    if not sl.get("location"):
-        return "location" if "location" not in asked else ("location_again" if "location_again" not in asked else None)
-    for p in sl["problems"]:
-        for q in PROTOCOL.get(p, []):
-            if q not in asked and sl.get(q) is None and not (q == "people" and sl.get("people")):
-                return q
-    if "name" not in asked:
-        return "name"
-    return None
-
-
-def caller_says(call: dict, text: str) -> None:
-    """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
-    hindi = call["hindi"]
-    call["turns"].append({"role": "caller", "text": text.strip(), "t": time.strftime("%H:%M:%S")})
-    got = extract_into(call, text)
-    sl = call["slots"]
-    parts = []
-    if not got and call.get("pending") not in ("description", "child_desc", "name"):
-        call["misses"][call.get("pending")] = call["misses"].get(call.get("pending"), 0) + 1
-    if "problems" in got or "location" in got:
-        what = ", ".join((PROBLEM_HI.get(p, PROBLEMS[p]["label"]) if hindi else PROBLEMS[p]["label"].lower())
-                         for p in sl.get("problems", [])) or ("आपात स्थिति" if hindi else "an emergency")
-        where = sl.get("location")
-        parts.append((f"ठीक है, {what}" + (f", {where} के पास।" if where else "।")) if hindi else
-                     (f"Okay, {what}" + (f" near {where}." if where else ".")))
-    if "people" in got and "problems" not in got:
-        parts.append(f"ठीक है, {sl['people']} लोग।" if hindi else f"Okay, {sl['people']} {'person' if sl['people'] == 1 else 'people'}.")
-    if "name" in got:
-        parts.append(f"धन्यवाद, {sl['name']}।" if hindi else f"Thank you, {sl['name']}.")
-    tri = call_triage(call)
-    old_sev, call["severity"] = call["severity"], int(tri["severity"])
-    # dispatch as soon as we know what and where (like a real call-taker, before all questions are done)
-    caller_turns = sum(1 for t_ in call["turns"] if t_["role"] == "caller")
-    unclear = not sl.get("problems") and sl.get("location") and caller_turns >= 3      # still unclear: police control room takes it
-    if (sl.get("problems") or unclear) and sl.get("location") and not call["dispatched"]:
-        rec = add_call(caller_text(call), tri, "Emergency call")
-        call["record"] = rec["Call ID"]
-        run_ = run_agents(caller_text(call), tri, call["ref"], "Emergency call", hint=(sl.get("problems") or [None])[0])
-        for a_ in run_["assignments"]:
-            a_["sent_at"] = time.time()
-        call["assignments"], call["dispatched"] = run_["assignments"], True
-        rec["assignments"], rec["teams"] = run_["assignments"], [a_["dept"] for a_ in run_["assignments"]]
-        units = sorted([a_ for a_ in run_["assignments"] if a_.get("unit")], key=lambda a_: a_["eta"])
-        teams = ", ".join(a_["dept"] for a_ in run_["assignments"])
-        if units:
-            rec["Help vehicle"] = units[0]["unit"]
-            parts.append(_l(SAY["sending"], hindi).format(teams=teams, unit=units[0]["unit"], eta=max(1, round(units[0]["eta"]))))
-        else:
-            parts.append((_l(SAY["queued"], hindi) + " ") if any(DEPARTMENTS[a_["dept"]]["fleet"] for a_ in run_["assignments"]) else "")
-            parts.append(_l(SAY["extra"], hindi).format(teams=teams))
-    elif call["dispatched"]:
-        # new problems in the conversation -> alert the extra departments
-        have = {a_["dept"] for a_ in call["assignments"]}
-        route = route_problem(caller_text(call), tri)
-        extra = [t_ for t_ in route["teams"] if t_["dept"] not in have]
-        if extra:
-            more = dispatch_departments(extra, sl.get("location"), call["ref"])
-            for a_ in more:
-                a_["sent_at"] = time.time()
-            call["assignments"] += more
-            st.session_state.setdefault("dept_jobs", []).extend(
-                {**{k: v for k, v in a_.items() if k != "route"}, "problem": ", ".join(route["labels"]), "location": sl.get("location"),
-                 "severity": call["severity"]} for a_ in more)
-            parts.append(_l(SAY["extra"], hindi).format(teams=", ".join(a_["dept"] for a_ in more)))
-        if call["severity"] == 5 and old_sev < 5:
-            parts.append(_l(SAY["upgraded"], hindi))
-        rec = next((c for c in st.session_state.calls if c["Call ID"] == call["record"]), None)
-        if rec:
-            rec.update(severity=call["severity"], people=sl.get("people"), **{"Call text": caller_text(call)})
-    # life-saving instructions, each given once
-    triggers = [("not_breathing", sl.get("breathing") is False), ("bleeding", sl.get("bleeding") is True),
-                ("gas", "gas_leak" in sl.get("problems", [])), ("fire", "fire" in sl.get("problems", [])),
-                ("unsafe", sl.get("caller_safe") is False), ("wire", "electric" in sl.get("problems", [])),
-                ("trapped", sl.get("trapped") is True), ("flood", "flood" in sl.get("problems", []))]
-    for key, on in triggers:
-        if on and key not in call["said_instructions"]:
-            call["said_instructions"].append(key)
-            parts.append(_l(INSTRUCT[key], hindi))
-    q = next_question(call)
-    if q is None and not got and not call["dispatched"]:
-        parts.append(_l(SAY["not_heard"], hindi))
-        q = call.get("pending")
-    if q:
-        call["asked"].append(q)
-        call["pending"] = q
-        parts.append(_l(CALL_Q[q], hindi))
-    else:
-        call["pending"] = None
-        parts.append(_l(SAY["done"], hindi))
-    agent_say(call, " ".join(p for p in parts if p))
-
-
-def call_transcript(call: dict) -> str:
-    lines = [f"Emergency call {call['ref']} ({time.strftime('%Y-%m-%d', time.localtime(call['started']))})"]
-    for t_ in call["turns"]:
-        lines.append(f"[{t_['t']}] {'Call-taker' if t_['role'] == 'agent' else 'Caller'}: {t_['text']}")
-    sl = call["slots"]
-    lines += ["", "Summary:", f"  Problem: {', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or 'unclear'}",
-              f"  Location: {sl.get('location') or 'unknown'}", f"  Severity: {call['severity']} of 5", f"  People: {sl.get('people') or 'not stated'}",
-              "  Teams: " + (", ".join(f"{a_['dept']} ({a_.get('unit') or a_.get('ticket') or a_.get('status')})" for a_ in call["assignments"]) or "none")]
-    return "\n".join(lines)
 
 
 # ----------------------- Emergency Help (native citizen page) -----------------------
@@ -1724,31 +1348,25 @@ def voice_recorder(key: str, label: str, api_key: str, whisper_model: str) -> di
     return res
 
 
-# ----------------------- Sidebar -----------------------
-st.sidebar.header("Configuration")
-use_groq = st.sidebar.toggle("Use Groq AI for triage", value=True)
-groq_key = st.sidebar.text_input(
-    "Groq API key",
-    value=os.getenv("GROQ_API_KEY", ""),
-    type="password",
-    help="Or add GROQ_API_KEY to Streamlit Secrets. Do not commit your key to GitHub.",
-)
-groq_model = st.sidebar.selectbox("Groq model", GROQ_MODELS, index=0, accept_new_options=True,
-                                  help="llama-3.3-70b-versatile is the most reliable for triage. Reasoning models "
-                                       "(openai/gpt-oss-…) are slower; if one fails, the app retries and then uses llama-3.3-70b-versatile.")
-st.sidebar.caption("If Groq is disabled or unavailable, rule-based triage is used.")
+# ----------------------- Settings (no configuration panel) -----------------------
+def _secret(name: str) -> str:
+    """Read a key from Streamlit Secrets or the environment, never from the page."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.getenv(name, "")
+
+
+groq_key = _secret("GROQ_API_KEY")          # add it in Manage app -> Settings -> Secrets to switch on Groq AI
+use_groq = bool(groq_key)
+groq_model = GROQ_FALLBACK_MODEL             # llama-3.3-70b-versatile: the most reliable for triage
+whisper_model = "whisper-large-v3-turbo"     # Groq speech-to-text, used only when a key is set
 triage_model = load_model(str(MODEL_FILE), MODEL_FILE.stat().st_mtime if MODEL_FILE.exists() else 0.0)
-use_model = triage_model is not None          # used automatically when triage_model.json is next to app.py
-whisper_model = st.sidebar.selectbox("Speech-to-text model (Groq)", ["whisper-large-v3-turbo", "whisper-large-v3"],
-                                     help="Used for recordings when a Groq key is set. Without a key, free Google speech recognition is used.")
-st.sidebar.divider()
-st.sidebar.subheader("Simulated road closures")
-closure_rows = st.sidebar.multiselect("Close horizontal street row(s)", options=list(range(GRID_SIZE)), default=[])
-closure_cols = st.sidebar.multiselect("Close vertical street column(s)", options=list(range(GRID_SIZE)), default=[])
-st.sidebar.divider()
-st.sidebar.subheader("Emergency Help")
-sim_seconds = st.sidebar.slider("Demo speed: real seconds per simulated minute", 0.5, 10.0, 2.0, step=0.5,
-                                help="Lower = help arrives faster in the demo. Travel times come from the road map.")
+use_model = triage_model is not None         # used automatically when triage_model.json is next to app.py
+closure_rows, closure_cols = [], []          # no simulated road closures
+sim_seconds = 2.0                            # demo speed: 2 real seconds per simulated minute
 
 if "calls" not in st.session_state:
     st.session_state.calls = []
@@ -1759,196 +1377,7 @@ if "used_vehicle_ids" not in st.session_state:
 if "help_reports" not in st.session_state:
     st.session_state.help_reports = []
 
-tab_call, tab_help, tab1, tab_dept, tab2, tab3 = st.tabs(["📞 Emergency call", "🆘 Emergency Help", "📝 Triage a call",
-                                                           "🏢 Departments & agents", "🚑 Dispatch board", "🗺️ City map"])
-
-with tab_call:
-    st.markdown(
-        "<div style='background:linear-gradient(135deg,#15202B,#1C5D99);color:#fff;border-radius:18px;padding:16px 22px;margin-bottom:8px'>"
-        "<div style='font-size:1.5rem;font-weight:800'>📞 Emergency call · 112</div>"
-        "<div style='opacity:.9'>Talk to the call-taker as you would on the phone. It asks what happened and where, sends the right teams "
-        "as soon as it knows, keeps asking the important questions, and tells you what to do while help comes.</div></div>",
-        unsafe_allow_html=True)
-    st.caption("Training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
-    call = st.session_state.get("call")
-    if call is None or call.get("ended") and st.session_state.get("call_closed_seen"):
-        c1, c2, c3 = st.columns([1.2, 1.2, 2])
-        lang_pick = c1.radio("Language", ["English", "हिन्दी (Hindi)"], horizontal=True, key="call_lang")
-        hands = c2.toggle("Hands-free", value=True, key="call_hands",
-                          help="The call-taker reads each question aloud, then the microphone starts listening by itself.")
-        if c3.button("📞 Start emergency call", type="primary", width="stretch"):
-            call = new_call(lang_pick.startswith("ह"))
-            agent_say(call, _l(CALL_Q["problem"], call["hindi"]))
-            call["asked"].append("problem")
-            st.session_state.call = call
-            st.session_state.call_closed_seen = False
-            st.rerun()
-        if call and call.get("ended"):
-            st.info(f"Last call {call['ref']} has ended. Start a new call when you need to.")
-    else:
-        left, right = st.columns([1.35, 1], gap="large")
-        with left:
-            box = st.container(height=430, border=True)
-            with box:
-                for t_ in call["turns"]:
-                    with st.chat_message("assistant" if t_["role"] == "agent" else "user",
-                                         avatar="🧑‍💼" if t_["role"] == "agent" else "🙋"):
-                        st.markdown(t_["text"])
-                        if t_.get("audio"):
-                            st.audio(t_["audio"], format="audio/wav")
-            lang = "hi-IN" if call["hindi"] else "en-IN"
-            answer = None
-            if not call["ended"]:
-                last_agent = next((t_ for t_ in reversed(call["turns"]) if t_["role"] == "agent"), None)
-                if VOICE_TYPING is not None:
-                    res = VOICE_TYPING(key=f"call_live_{lang}",
-                                       data={"lang": lang, "say": last_agent["text"] if last_agent else "",
-                                             "say_id": f"{call['ref']}-{len(call['turns'])}", "auto": st.session_state.get("call_hands", True)},
-                                       on_done_change=lambda: None, on_env_change=lambda: None)
-                    done = getattr(res, "done", None)
-                    if done and done.get("id") != st.session_state.get("call_live_id"):
-                        st.session_state.call_live_id = done["id"]
-                        audio = base64.b64decode(done["audio"]) if done.get("audio") else None
-                        text = (done.get("text") or "").strip()
-                        if not text and audio and wav_stats(audio)["peak"] >= 0.01:
-                            try:
-                                text, _eng = transcribe_audio(audio, lang, groq_key, whisper_model)
-                            except RuntimeError:
-                                text = ""
-                        if text:
-                            answer = (text, audio)
-                        else:
-                            agent_say(call, _l(SAY["not_heard"], call["hindi"]))
-                            st.rerun()
-                typed = st.chat_input("Or type your answer…", key="call_typed")
-                if typed:
-                    answer = (typed, None)
-                if call.get("pending") == "location_again" or (call["slots"].get("problems") and not call["slots"].get("location")
-                                                               and "location_again" in call["asked"]):
-                    pick = st.selectbox("Pick the nearest landmark", [""] + sorted(LANDMARKS), key=f"call_pick_{len(call['turns'])}")
-                    if pick:
-                        answer = (pick, None)
-                if answer:
-                    caller_says(call, answer[0])
-                    if answer[1]:
-                        call["turns"][-2]["audio"] = answer[1]           # the caller's turn keeps its recording
-                    st.rerun()
-                b1, b2 = st.columns(2)
-                if b1.button("🔚 End call", width="stretch"):
-                    call["ended"] = True
-                    agent_say(call, _l(SAY["ended"], call["hindi"]).format(ref=call["ref"]))
-                    st.rerun()
-                b2.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt",
-                                   "text/plain", width="stretch")
-            else:
-                st.success(f"Call {call['ref']} ended. The teams keep working; you can still follow them on the right.")
-                d1, d2 = st.columns(2)
-                d1.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt",
-                                   "text/plain", width="stretch")
-                if d2.button("📞 Start a new call", type="primary", width="stretch"):
-                    st.session_state.call_closed_seen = True
-                    st.session_state.call = None
-                    st.rerun()
-
-        with right:
-            @st.fragment(run_every=1.0)
-            def call_panel() -> None:
-                c_ = st.session_state.get("call")
-                if not c_:
-                    return
-                sl = c_["slots"]
-                with st.container(border=True):
-                    st.markdown(f"#### What the call-taker knows  \n<span style='opacity:.7'>Reference {c_['ref']}</span>", unsafe_allow_html=True)
-                    sev = c_["severity"]
-                    st.markdown(f"<span style='display:inline-block;background:{SEV_COLOR.get(sev)};color:#fff;border-radius:10px;padding:2px 12px;"
-                                f"font-size:1.4rem;font-weight:800'>{sev}</span> of 5 · {SEVERITY_GUIDE.get(sev, '')}", unsafe_allow_html=True)
-                    k1, k2 = st.columns(2)
-                    k1.markdown(f"**Problem**  \n{', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or '…listening'}")
-                    k2.markdown(f"**Location**  \n{sl.get('location') or '…not yet'}")
-                    k3, k4 = st.columns(2)
-                    k3.markdown(f"**People**  \n{sl.get('people') or 'not stated'}")
-                    signs = [lbl for key, val, lbl in [("breathing", False, "not breathing"), ("trapped", True, "trapped"),
-                                                       ("bleeding", True, "heavy bleeding"), ("spreading", True, "spreading"),
-                                                       ("weapon", True, "weapon"), ("caller_safe", False, "caller not safe"),
-                                                       ("touching_wire", True, "touching wire")] if sl.get(key) is val]
-                    k4.markdown(f"**Danger signs**  \n{', '.join(signs) or 'none reported'}")
-                    if sl.get("description") or sl.get("child_desc"):
-                        st.markdown(f"**Description**  \n{sl.get('child_desc') or ''} {sl.get('description') or ''}")
-                    if sl.get("name"):
-                        st.markdown(f"**Caller**  \n{sl['name']}")
-                with st.container(border=True):
-                    st.markdown("#### Teams")
-                    if not c_["assignments"]:
-                        st.caption("Help is sent as soon as the call-taker knows what happened and where.")
-                    now = time.time()
-                    for a_ in c_["assignments"]:
-                        if a_.get("unit"):
-                            left_ = a_["eta"] - (now - a_.get("sent_at", now)) / sim_seconds
-                            state = f"{max(1, math.ceil(left_))} min away" if left_ > 0 else "✅ arrived"
-                            st.markdown(f"{a_['icon']} **{a_['dept']}**{' (lead)' if a_.get('role') == 'lead' else ''} · {a_['unit']} · {state}")
-                            if left_ > 0:
-                                st.progress(min(1.0, max(0.0, 1 - left_ / a_["eta"])))
-                        else:
-                            st.markdown(f"{a_['icon']} **{a_['dept']}** · {a_.get('ticket') or ''} {a_['status']}")
-                    if c_["assignments"]:
-                        st.caption("Every agent's decision is on the 🏢 Departments & agents tab.")
-            call_panel()
-
-with tab_dept:
-    st.subheader("How a call reaches the right team")
-    st.caption("Like 112 in India or 911 in the USA: one number, then each agent does one job and passes the call on. "
-               "The triage and router agents are constrained: they can only choose from fixed lists, so they never invent "
-               "a department, a severity or a place. Anything unclear goes to a human supervisor.")
-    st.graphviz_chart(AGENT_DIAGRAM)
-
-    runs = st.session_state.get("agent_runs", [])
-    st.markdown("#### Latest call, step by step")
-    if not runs:
-        st.info("Send a report on **Emergency Help**, or press **Send to these departments** after triaging a call. "
-                "Every agent's decision appears here.")
-    else:
-        pick = st.selectbox("Show the agents' work for", [r_["ref"] for r_ in runs][::-1], key="agent_pick")
-        run_ = next(r_ for r_ in runs if r_["ref"] == pick)
-        for k_, stp in enumerate(run_["steps"], 1):
-            st.markdown(f"<div style='display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:start;padding:8px 10px;"
-                        f"border:1px solid rgba(128,128,128,.25);border-radius:12px;margin-bottom:6px'>"
-                        f"<div style='font-size:1.4rem'>{stp['icon']}</div><div><b>{k_}. {stp['agent']}</b><br>"
-                        f"<span style='opacity:.85'>{stp['did']}</span></div><div style='opacity:.6;font-size:.8rem'>{stp['ms']} ms</div></div>",
-                        unsafe_allow_html=True)
-        st.caption(f"Whole pipeline: {run_['total_ms']} ms.")
-
-    st.markdown("#### Department boards")
-    jobs = st.session_state.get("dept_jobs", [])
-    names = list(DEPARTMENTS)
-    for row_ in (names[:4], names[4:]):
-        cols = st.columns(4)
-        for col, d in zip(cols, row_):
-            info = DEPARTMENTS[d]
-            mine = [j for j in jobs if j["dept"] == d]
-            with col.container(border=True):
-                st.markdown(f"**{info['icon']} {d}**  \n<span style='opacity:.7;font-size:.85rem'>Helpline {info['line']} · "
-                            f"USA: {info['us']}</span>", unsafe_allow_html=True)
-                st.metric("Jobs", len(mine), label_visibility="collapsed")
-                for j in mine[::-1][:4]:
-                    what = j.get("unit") or j.get("ticket") or "waiting"
-                    st.markdown(f"<div style='font-size:.85rem;border-top:1px solid rgba(128,128,128,.2);padding-top:4px'>"
-                                f"<b>{j['ref']}</b> {j['problem']}<br>{j.get('location') or 'location unknown'} · {what} · "
-                                f"<span style='opacity:.7'>{j['status']}</span></div>", unsafe_allow_html=True)
-                if not mine:
-                    st.caption("No jobs yet.")
-
-    with st.expander("🇮🇳 India 112 and 🇺🇸 USA 911: the same idea"):
-        st.markdown("""
-| Step | India (112 ERSS) | USA (911) | In this app |
-|---|---|---|---|
-| One emergency number | 112 (also 100, 101, 108) | 911 | Emergency Help page |
-| Call-taker answers | ERC call-taker | PSAP call-taker | 🎙️ Intake agent |
-| Questions: what, where, how bad | Structured questions | Protocols such as EMD | 🧭 Triage agent (constrained) |
-| Decide who must act | Dispatcher selects agencies | CAD system recommends units | 🔀 Router agent (constrained) |
-| Agencies send units | Police, fire, ambulance, NDRF | Police, fire, EMS | 🚓 🚒 🚑 🛟 department agents |
-| Specialist lines | 1091 women, 1098 child, 1906 gas, 1912 power | Hotlines, utilities, CPS | 👩 🧒 🛢️ ⚡ tickets and call-backs |
-| Supervisor checks unclear calls | Shift supervisor | Supervisor / QA | 🧑‍💼 human in the loop |
-""")
+tab_help, tab_dept, tab2 = st.tabs(["🆘 Emergency Help", "🏢 Departments & agents", "🚑 Dispatch board"])
 
 with tab_help:
     st.markdown(
@@ -2145,147 +1574,60 @@ with tab_help:
                 st.download_button("Download help requests and feedback (CSV)", table.to_csv(index=False).encode("utf-8"),
                                    file_name="help_requests.csv", mime="text/csv")
 
-with tab1:
-    st.subheader("Triage incoming calls")
-    one_tab, many_tab = st.tabs(["📞 One call", "📋 Many calls at once"])
+with tab_dept:
+    st.subheader("How a call reaches the right team")
+    st.caption("Like 112 in India or 911 in the USA: one number, then each agent does one job and passes the call on. "
+               "The triage and router agents are constrained: they can only choose from fixed lists, so they never invent "
+               "a department, a severity or a place. Anything unclear goes to a human supervisor.")
+    st.graphviz_chart(AGENT_DIAGRAM)
 
-    with one_tab:
-        in_col, out_col = st.columns([1, 1.15], gap="large")
-        with in_col:
-            sample = st.selectbox("Try a sample call", SAMPLE_CALLS, index=None, key="sample_pick",
-                                  placeholder="Choose a sample, or type or speak below")
-            if sample and st.session_state.get("last_sample") != sample:      # picking a sample replaces the transcript
-                st.session_state.last_sample = sample
-                st.session_state.call_text = sample
-                st.session_state.call_audio = st.session_state.voice_text = None
-            with st.expander("🎙️ Speak your complaint instead of typing", expanded=True):
-                auto = st.checkbox("Triage automatically as soon as my words are written", value=True, key="tri_auto")
-                spoken = voice_recorder("tri", "Record your complaint", groq_key, whisper_model)
-                if spoken and spoken.get("new") and spoken.get("text"):
-                    st.session_state.call_text = spoken["text"]
-                    st.session_state.voice_text = spoken["text"]
-                    st.session_state.call_engine = spoken["engine"]
-                    st.session_state.call_audio = spoken["audio"]
-                    spoken["new"] = False
-                    if auto:
-                        st.session_state.auto_triage = True
-                if spoken and spoken.get("text"):
-                    if spoken["lang"] == "hi-IN" and not groq_key:
-                        st.caption("Keyword rules understand English best. Add a Groq key for AI triage of Hindi calls.")
-            with st.form("triage_form", border=False):
-                call_text = st.text_area("Call transcript", key="call_text", height=130,
-                                         placeholder="Type what the caller says…", help="Press Ctrl+Enter (⌘+Enter on Mac) to triage.")
-                f1, f2 = st.columns([1, 1])
-                submitted = f1.form_submit_button("Triage call", type="primary", width="stretch")
-                f2.form_submit_button("Clear", width="stretch", on_click=lambda: st.session_state.update(
-                    call_text="", call_audio=None, voice_text=None, last_sample=None, sample_pick=None))
-            st.caption("Tip: Ctrl+Enter triages straight from the text box.")
-        with out_col:
-            run_now = submitted or st.session_state.pop("auto_triage", False)
-            if run_now:
-                text = (st.session_state.get("call_text") or "").strip()
-                if not text:
-                    st.error("Type, speak or choose a call first.")
-                else:
-                    with st.spinner("Triaging…"):
-                        t0 = time.perf_counter()
-                        triage, msgs = run_triage(text)
-                        took = (time.perf_counter() - t0) * 1000
-                    for kind_, m_ in msgs:
-                        getattr(st, kind_)(m_)
-                    src, engine, audio = source_of(text, st.session_state.get("last_sample"))
-                    rec = add_call(text, triage, src, engine, audio)
-                    rec["Triage ms"] = round(took)
-                    st.session_state.last_call_id = rec["Call ID"]
-            last = next((c for c in st.session_state.calls if c["Call ID"] == st.session_state.get("last_call_id")), None)
-            if last:
-                show_triage_card(last)
-                call_actions(last)
-                st.caption(f"Triaged in {last.get('Triage ms', 0)} ms.")
-            else:
-                with st.container(border=True):
-                    st.markdown("#### Result")
-                    st.info("Choose a sample, or type or speak a call, then press **Triage call**. The result appears here.")
+    runs = st.session_state.get("agent_runs", [])
+    st.markdown("#### Latest call, step by step")
+    if not runs:
+        st.info("Send a report on **Emergency Help**. Every agent's decision appears here.")
+    else:
+        pick = st.selectbox("Show the agents' work for", [r_["ref"] for r_ in runs][::-1], key="agent_pick")
+        run_ = next(r_ for r_ in runs if r_["ref"] == pick)
+        for k_, stp in enumerate(run_["steps"], 1):
+            st.markdown(f"<div style='display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:start;padding:8px 10px;"
+                        f"border:1px solid rgba(128,128,128,.25);border-radius:12px;margin-bottom:6px'>"
+                        f"<div style='font-size:1.4rem'>{stp['icon']}</div><div><b>{k_}. {stp['agent']}</b><br>"
+                        f"<span style='opacity:.85'>{stp['did']}</span></div><div style='opacity:.6;font-size:.8rem'>{stp['ms']} ms</div></div>",
+                        unsafe_allow_html=True)
+        st.caption(f"Whole pipeline: {run_['total_ms']} ms.")
 
-    with many_tab:
-        st.caption("For a call burst: paste one call per line, or upload a CSV with a `text` column. Up to 200 calls.")
-        b1, b2 = st.columns([1.3, 1])
-        batch_text = b1.text_area("Calls, one per line", height=180, key="batch_text",
-                                  placeholder="fire near the shopping mall, people inside\nmy father fell near the old temple\n…")
-        batch_file = b2.file_uploader("…or a CSV file", type=["csv", "txt"], key="batch_file")
-        add_hist = b2.checkbox("Add to the triage history and dispatch board", value=True, key="batch_add")
-        if st.button("Triage all", type="primary", key="batch_go"):
-            lines = [ln.strip() for ln in (batch_text or "").splitlines() if ln.strip()]
-            if batch_file is not None:
-                try:
-                    df_in = pd.read_csv(batch_file)
-                    col = next((c for c in df_in.columns if str(c).lower() in ("text", "call", "call_text", "transcript")), df_in.columns[0])
-                    lines += [str(x).strip() for x in df_in[col].dropna() if str(x).strip()]
-                except Exception as exc:
-                    st.error(f"Could not read the file: {exc}")
-            lines = lines[:200]
-            if not lines:
-                st.warning("Paste some calls or upload a file first.")
-            else:
-                bar, out_rows, t0 = st.progress(0.0, text="Triaging…"), [], time.perf_counter()
-                for i, ln in enumerate(lines):
-                    tri, _ = run_triage(ln)
-                    if add_hist:
-                        r_ = add_call(ln, tri, "Batch")
-                    else:
-                        r_ = {"Call ID": f"B-{i + 1:03d}", "Call text": ln, **tri}
-                    out_rows.append(r_)
-                    bar.progress((i + 1) / len(lines), text=f"Triaging… {i + 1}/{len(lines)}")
-                bar.empty()
-                secs = time.perf_counter() - t0
-                st.session_state.batch_result = pd.DataFrame([{
-                    "Call ID": r_["Call ID"], "Emergency": r_.get("incident_type"), "Severity": int(r_.get("severity", 0)),
-                    "Location": r_.get("location") or "Unknown", "Duplicate of": r_.get("duplicate_of") or "",
-                    "Needs review": bool(r_.get("needs_review")) or not r_.get("location"),
-                    "Confidence": r_.get("confidence"), "Call": r_["Call text"]} for r_ in out_rows])
-                st.session_state.batch_note = f"{len(lines)} calls triaged in {secs:.1f} s ({1000 * secs / len(lines):.0f} ms per call)."
-        res = st.session_state.get("batch_result")
-        if res is not None and len(res):
-            st.success(st.session_state.get("batch_note", ""))
-            em = res[res["Emergency"] != "Noise / prank"]
-            k1, k2, k3, k4, k5 = st.columns(5)
-            k1.metric("Emergencies", len(em)); k2.metric("Severe (4-5)", int((em["Severity"] >= 4).sum()))
-            k3.metric("Duplicates joined", int((res["Duplicate of"] != "").sum()))
-            k4.metric("Unknown location", int((em["Location"] == "Unknown").sum())); k5.metric("Pranks filtered", int((res["Emergency"] == "Noise / prank").sum()))
-            st.dataframe(res.sort_values(["Severity", "Call ID"], ascending=[False, True]), hide_index=True, width="stretch",
-                         column_config={"Severity": st.column_config.ProgressColumn("Severity", min_value=0, max_value=5, format="%d"),
-                                        "Confidence": st.column_config.NumberColumn("Confidence", format="percent"),
-                                        "Call": st.column_config.TextColumn("Call", width="large")})
-            st.download_button("Download results (CSV)", res.to_csv(index=False).encode("utf-8"), "triage_batch.csv", "text/csv")
+    st.markdown("#### Department boards")
+    jobs = st.session_state.get("dept_jobs", [])
+    names = list(DEPARTMENTS)
+    for row_ in (names[:4], names[4:]):
+        cols = st.columns(4)
+        for col, d in zip(cols, row_):
+            info = DEPARTMENTS[d]
+            mine = [j for j in jobs if j["dept"] == d]
+            with col.container(border=True):
+                st.markdown(f"**{info['icon']} {d}**  \n<span style='opacity:.7;font-size:.85rem'>Helpline {info['line']} · "
+                            f"USA: {info['us']}</span>", unsafe_allow_html=True)
+                st.metric("Jobs", len(mine), label_visibility="collapsed")
+                for j in mine[::-1][:4]:
+                    what = j.get("unit") or j.get("ticket") or "waiting"
+                    st.markdown(f"<div style='font-size:.85rem;border-top:1px solid rgba(128,128,128,.2);padding-top:4px'>"
+                                f"<b>{j['ref']}</b> {j['problem']}<br>{j.get('location') or 'location unknown'} · {what} · "
+                                f"<span style='opacity:.7'>{j['status']}</span></div>", unsafe_allow_html=True)
+                if not mine:
+                    st.caption("No jobs yet.")
 
-    if st.session_state.calls:
-        st.markdown("#### Triage history")
-        calls_ = st.session_state.calls
-        em_ = [c for c in calls_ if c.get("is_emergency")]
-        h1, h2, h3, h4, h5 = st.columns(5)
-        h1.metric("Calls", len(calls_)); h2.metric("Severe (4-5)", sum(int(c.get("severity", 0)) >= 4 for c in em_))
-        h3.metric("Duplicates joined", sum(bool(c.get("duplicate_of")) for c in calls_))
-        h4.metric("Need review", sum(bool(c.get("needs_review")) or not c.get("location") for c in em_))
-        h5.metric("Vehicles sent", sum(bool(c.get("Help vehicle")) for c in calls_))
-        hist = pd.DataFrame([{"Call ID": c["Call ID"], "Time": c.get("Triaged at", ""), "Source": c.get("Source", ""),
-                              "Incident type": c.get("incident_type"), "Severity": int(c.get("severity", 0)),
-                              "Location": c.get("location") or "Unknown", "Duplicate of": c.get("duplicate_of") or "",
-                              "Vehicle": c.get("Help vehicle") or "", "Triage method": c.get("triage_method", ""),
-                              "Confidence": c.get("confidence") if isinstance(c.get("confidence"), (int, float)) else None,
-                              "Call": c["Call text"]} for c in reversed(calls_)])
-        st.dataframe(hist, hide_index=True, width="stretch",
-                     column_config={"Severity": st.column_config.ProgressColumn("Severity", min_value=0, max_value=5, format="%d"),
-                                    "Confidence": st.column_config.NumberColumn("Confidence", format="percent", help="Empty = not measured (keyword rules only)"),
-                                    "Call": st.column_config.TextColumn("Call", width="large")})
-        d1, d2 = st.columns([1, 4])
-        d1.download_button("Download history (CSV)", hist.to_csv(index=False).encode("utf-8"), "triage_history.csv", "text/csv")
-        voiced = [c for c in calls_ if c.get("Recording")]
-        if voiced:
-            with st.expander(f"🎧 Listen to voice complaints ({len(voiced)})"):
-                for c in reversed(voiced):
-                    st.markdown(f"**{c['Call ID']}**: {c['incident_type']}, severity {c['severity']}, "
-                                f"{c.get('location') or 'location unknown'}. “{c['Call text']}”")
-                    st.audio(c["Recording"], format="audio/wav")
+    with st.expander("🇮🇳 India 112 and 🇺🇸 USA 911: the same idea"):
+        st.markdown("""
+| Step | India (112 ERSS) | USA (911) | In this app |
+|---|---|---|---|
+| One emergency number | 112 (also 100, 101, 108) | 911 | Emergency Help page |
+| Call-taker answers | ERC call-taker | PSAP call-taker | 🎙️ Intake agent |
+| Questions: what, where, how bad | Structured questions | Protocols such as EMD | 🧭 Triage agent (constrained) |
+| Decide who must act | Dispatcher selects agencies | CAD system recommends units | 🔀 Router agent (constrained) |
+| Agencies send units | Police, fire, ambulance, NDRF | Police, fire, EMS | 🚓 🚒 🚑 🛟 department agents |
+| Specialist lines | 1091 women, 1098 child, 1906 gas, 1912 power | Hotlines, utilities, CPS | 👩 🧒 🛢️ ⚡ tickets and call-backs |
+| Supervisor checks unclear calls | Shift supervisor | Supervisor / QA | 🧑‍💼 human in the loop |
+""")
 
 with tab2:
     st.subheader("Prioritized incident and dispatch board")
@@ -2360,19 +1702,6 @@ with tab2:
         st.session_state.dispatches = []
         st.session_state.used_vehicle_ids = set()
         st.rerun()
-
-with tab3:
-    st.subheader("Simulated city map")
-    st.caption("A grid simulation only; it does not represent real roads, GPS, or live traffic.")
-    graph = add_closures(make_city_graph(), closure_rows, closure_cols)
-    fig = draw_map(st.session_state.calls, st.session_state.dispatches, closure_rows, closure_cols)
-    st.pyplot(fig, width="stretch")
-    plt.close(fig)                      # free memory: Streamlit reruns this script on every click
-    st.markdown("#### Landmark directory")
-    st.dataframe(
-        pd.DataFrame([{"Landmark": name, "Grid X": xy[0], "Grid Y": xy[1]} for name, xy in LANDMARKS.items()]),
-        width="stretch",
-    )
 
 st.divider()
 st.caption("Audit note: this demo displays triage method, confidence, call history, incident grouping, and simulated dispatch estimates. Verify all logic and safety requirements before any real-world use.")
