@@ -23,6 +23,25 @@ try:
 except ImportError:
     Groq = None
 
+import uuid
+
+try:                                    # observability: traces, feedback and evaluations in LangSmith
+    import langsmith
+    from langsmith import Client as LangSmithClient, traceable
+except ImportError:                     # the app works the same without it
+    langsmith, LangSmithClient = None, None
+
+    def traceable(*dargs, **dkwargs):
+        """No-op stand-in for langsmith.traceable (accepts and ignores langsmith_extra)."""
+        def deco(fn):
+            def wrapper(*a, langsmith_extra=None, **kw):
+                return fn(*a, **kw)
+            wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+            return wrapper
+        if dargs and callable(dargs[0]) and len(dargs) == 1 and not dkwargs:
+            return deco(dargs[0])
+        return deco
+
 try:                                    # free speech-to-text used when no Groq key is set
     import speech_recognition as sr
 except ImportError:
@@ -215,7 +234,7 @@ def match_location(text: str) -> str | None:
         "अस्पताल": "Central Hospital", "हॉस्पिटल": "Central Hospital", "रेलवे": "Railway Station", "स्टेशन": "Railway Station",
         "पुल": "River Bridge", "बाजार": "Central Market", "बाज़ार": "Central Market", "मार्केट": "Central Market",
         "स्कूल": "North School", "मॉल": "Shopping Mall", "स्टेडियम": "Stadium", "मंदिर": "Old Temple",
-        "पेट्रोल पंप": "Petrol Pump", "बस अड्डा": "Bus Terminal", "बस स्टैंड": "Bus Terminal", "थाना": "Police Station",
+        "पेट्रोल पंप": "Petrol Pump", "बस अड्डा": "Bus Terminal", "बस अड्डे": "Bus Terminal", "बस स्टैंड": "Bus Terminal", "थाना": "Police Station",
         "एयरपोर्ट": "Airport Road", "फैक्ट्री": "Industrial Area", "नदी": "River Bank",
     }
     for phrase, landmark in aliases.items():
@@ -227,6 +246,7 @@ GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile"     # follows the JSON format re
 GROQ_MODELS = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 
 
+@traceable(run_type="llm", name="Groq triage", process_inputs=lambda i: {"call_text": i.get("call_text"), "model": i.get("model")})
 def groq_triage(call_text: str, api_key: str, model: str) -> dict[str, Any]:
     if Groq is None:
         raise RuntimeError("Groq package is not installed. Install requirements.txt.")
@@ -491,6 +511,7 @@ def cached_groq_triage(call_text: str, api_key: str, model: str) -> dict:
     return groq_triage(call_text, api_key, model)
 
 
+@traceable(run_type="chain", name="Triage agent")
 def run_triage(call_text: str) -> tuple[dict, list[tuple[str, str]]]:
     """Groq AI if switched on and configured, otherwise rules (+ the learned model). Returns (triage, messages)."""
     msgs, triage = [], None
@@ -574,15 +595,18 @@ PROBLEMS = {      # the ONLY problem categories the router may choose; each one 
     "gas_leak":      {"label": "Gas leak", "kw": ["gas leak", "gas smell", "smell of gas", "cylinder", "lpg"], "teams": ["Fire & Rescue", "Gas Emergency"]},
     "medical":       {"label": "Medical emergency", "kw": ["unconscious", "not breathing", "heart attack", "chest pain", "fainted", "seizure",
                                                           "stroke", "bleeding", "injured", "hurt", "labour pain", "snake bite", "poison",
-                                                          "overdose", "behosh", "fell", "not moving"], "teams": ["Ambulance (EMS)"]},
+                                                          "overdose", "behosh", "fell", "not moving", "collapsed", "burns"],
+                      "teams": ["Ambulance (EMS)"]},
     "road_accident": {"label": "Road accident", "kw": ["accident", "crash", "collided", "collision", "hit by", "overturned", "run over",
                                                        "skidded"], "teams": ["Ambulance (EMS)", "Police"]},
-    "collapse":      {"label": "Building collapse", "kw": ["collapse", "building fell", "wall fell", "roof fell", "rubble", "debris",
-                                                           "came down"], "teams": ["Disaster Response", "Fire & Rescue"]},
-    "flood":         {"label": "Flood / drowning", "kw": ["flood", "water rising", "drowning", "waterlogging", "washed away", "baadh"],
+    "collapse":      {"label": "Building collapse", "kw": ["building collapse", "collapsed building", "building collapsed", "house collapsed",
+                                                           "wall collapsed", "roof collapsed", "bridge collapsed", "building fell", "wall fell",
+                                                           "roof fell", "rubble", "debris", "came down"], "teams": ["Disaster Response", "Fire & Rescue"]},
+    "flood":         {"label": "Flood / drowning", "kw": ["flood", "water rising", "water is rising", "rising water", "drowning", "waterlogging",
+                                                          "washed away", "stuck on the roof", "stuck on his roof", "baadh"],
                       "teams": ["Disaster Response"]},
-    "crime":         {"label": "Crime / violence", "kw": ["robbery", "robbed", "theft", "stolen", "thief", "burglary", "break in", "broke into",
-                                                          "snatch", "gun", "pistol", "knife", "shot", "shooting", "stabbed", "fight",
+    "crime":         {"label": "Crime / violence", "kw": ["robbery", "robbed", "robbing", "theft", "stolen", "thief", "burglary", "break in", "broke into",
+                                                          "snatch", "gun", "pistol", "knife", "knives", "shot", "shooting", "stabbed", "fight",
                                                           "beating", "attack", "assault", "threat", "kidnap", "murder", "chor", "loot"],
                       "teams": ["Police"]},
     "women_safety":  {"label": "Women safety", "kw": ["harass", "stalking", "stalker", "molest", "eve teasing", "domestic violence",
@@ -613,6 +637,8 @@ CALLBACK_MIN = {"Gas Emergency": 15, "Electricity Board": 20, "Women Helpline": 
 def rule_problems(text: str) -> list[tuple[str, str]]:
     """Every problem category whose keywords appear, with the word that decided it."""
     t = " " + text.lower() + " "
+    for neg in NEGATIONS:                                  # "nobody hurt" does not make it a medical call
+        t = t.replace(neg, " ")
     found = []
     for pid, p in PROBLEMS.items():
         hit = next((k for k in p["kw"] if k in t), None)
@@ -622,6 +648,7 @@ def rule_problems(text: str) -> list[tuple[str, str]]:
 
 
 @st.cache_data(show_spinner=False, max_entries=500, ttl=3600)
+@traceable(run_type="llm", name="Router LLM (constrained)", process_inputs=lambda i: {"text": i.get("text"), "model": i.get("model")})
 def llm_problems(text: str, api_key: str, model: str) -> list[str]:
     """Constrained LLM routing: the model may only pick ids from PROBLEMS; anything else is thrown away."""
     prompt = ("You route emergency calls to departments. Choose ALL problem ids that apply, ONLY from this list:\n"
@@ -642,6 +669,7 @@ def llm_problems(text: str, api_key: str, model: str) -> list[str]:
     return []
 
 
+@traceable(run_type="chain", name="Router agent")
 def route_problem(text: str, triage: dict, hint: str | None = None) -> dict:
     """Router agent: problem categories -> departments (lead + support), each with a reason."""
     rules = rule_problems(text)
@@ -663,8 +691,10 @@ def route_problem(text: str, triage: dict, hint: str | None = None) -> dict:
                 teams[d] = {"dept": d, "role": "lead" if not teams else "support",
                             "why": f"{PROBLEMS[pid]['label'].lower()}" + (f" (caller said “{why[pid]}”)" if pid in why else "")}
                 order.append(d)
-    t = text.lower()
-    injured = any(w in t for w in INJURY_WORDS) or int(triage.get("severity", 1)) >= 4
+    t = " " + text.lower() + " "
+    for neg in NEGATIONS:                                  # "nobody hurt" is not an injury
+        t = t.replace(neg, " ")
+    injured = any(w in t for w in INJURY_WORDS) or int(triage.get("severity", 1)) >= 5
     if injured and "Ambulance (EMS)" not in teams and (picked or triage.get("is_emergency")):
         teams["Ambulance (EMS)"] = {"dept": "Ambulance (EMS)", "role": "support", "why": "someone may be injured"}
         order.append("Ambulance (EMS)")
@@ -689,6 +719,8 @@ def route_problem(text: str, triage: dict, hint: str | None = None) -> dict:
             "method": method, "injured": injured, "review": review}
 
 
+@traceable(run_type="tool", name="Department agents",
+           process_outputs=lambda o: {"assignments": [{k: v for k, v in a.items() if k != "route"} for a in (o or [])]})
 def dispatch_departments(teams: list[dict], location: str | None, ref: str) -> list[dict]:
     """Department agents: each sends its nearest free unit, or opens a ticket and calls back."""
     graph, out = None, []
@@ -726,6 +758,10 @@ def dispatch_departments(teams: list[dict], location: str | None, ref: str) -> l
     return out
 
 
+@traceable(run_type="chain", name="Dispatch pipeline",
+           process_inputs=lambda i: {"text": i.get("text"), "ref": i.get("ref"), "source": i.get("source"), "hint": i.get("hint")},
+           process_outputs=lambda o: {"problems": o["route"]["labels"], "teams": [t["dept"] for t in o["route"]["teams"]],
+                                      "review": o["route"]["review"]})
 def run_agents(text: str, triage: dict, ref: str, source: str, voice: dict | None = None, hint: str | None = None,
                dispatch: bool = True) -> dict:
     """The whole pipeline, recorded step by step so anyone can see who decided what."""
@@ -975,7 +1011,10 @@ def next_question(call: dict) -> str | None:
     return None
 
 
-def caller_says(call: dict, text: str) -> None:
+@traceable(run_type="chain", name="Call-taker turn",
+           process_inputs=lambda i: {"caller": i.get("text"), "ref": i["call"]["ref"], "asked": i["call"].get("pending"),
+                                     "language": "hi" if i["call"].get("hindi") else "en"})
+def caller_says(call: dict, text: str) -> dict:
     """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
     hindi = call["hindi"]
     call["turns"].append({"role": "caller", "text": text.strip(), "t": time.strftime("%H:%M:%S")})
@@ -1055,6 +1094,9 @@ def caller_says(call: dict, text: str) -> None:
         call["pending"] = None
         parts.append(_l(SAY["done"], hindi))
     agent_say(call, " ".join(p for p in parts if p))
+    return {"reply": call["turns"][-1]["text"], "understood": got, "severity": call["severity"],
+            "problems": sl.get("problems", []), "location": sl.get("location"),
+            "teams": [a_["dept"] for a_ in call["assignments"]], "next_question": call.get("pending")}
 
 
 def call_transcript(call: dict) -> str:
@@ -1066,122 +1108,6 @@ def call_transcript(call: dict) -> str:
               f"  Location: {sl.get('location') or 'unknown'}", f"  Severity: {call['severity']} of 5", f"  People: {sl.get('people') or 'not stated'}",
               "  Teams: " + (", ".join(f"{a_['dept']} ({a_.get('unit') or a_.get('ticket') or a_.get('status')})" for a_ in call["assignments"]) or "none")]
     return "\n".join(lines)
-
-
-# ----------------------- Emergency Help (native citizen page) -----------------------
-HELPLINES = [("112", "All emergencies"), ("108", "Ambulance"), ("101", "Fire"), ("100", "Police"),
-             ("1091", "Women helpline"), ("1098", "Child helpline"), ("1906", "Gas leak"), ("1912", "Electricity")]
-HELP_TYPES = {   # button -> (triage type, words added to the report, problem id for the router)
-    "🔥 Fire": ("Fire", "fire", "fire"),
-    "🚑 Medical": ("Medical", "medical emergency", "medical"),
-    "🚗 Road accident": ("Medical", "road accident, people injured", "road_accident"),
-    "🏚️ Building collapse": ("Rescue", "building collapse", "collapse"),
-    "🌊 Flood": ("Rescue", "flood water rising", "flood"),
-    "💨 Gas leak": ("Fire", "gas leak, strong gas smell", "gas_leak"),
-    "🚓 Crime / fight": ("Police", "crime, robbery or fight", "crime"),
-    "👩 Women safety": ("Police", "woman being harassed, women safety", "women_safety"),
-    "🧒 Child in danger": ("Police", "child missing or in danger", "child"),
-    "⚡ Electric hazard": ("Rescue", "live electric wire fallen", "electric"),
-}
-DANGER_SIGNS = {"Someone is trapped": 5, "Someone is not breathing or unconscious": 5,
-                "Heavy bleeding": 4, "Fire or danger is spreading": 4, "Someone is injured": 3}
-WHILE_YOU_WAIT = {
-    "Fire": ["Get everyone out and stay out. Do not go back inside for belongings.",
-             "If there is smoke, stay low, close doors behind you, and do not use lifts.",
-             "If gas is leaking: no flames or switches; open doors and windows only if it is safe, then leave."],
-    "Medical": ["Stay with the person and keep them still, warm and calm. Do not give food or drink.",
-                "If they are not breathing normally and you are trained, start CPR; otherwise follow the 112 operator's instructions.",
-                "Press firmly on heavy bleeding with a clean cloth and keep pressing.",
-                "After a road accident, switch on hazard lights and do not move injured people unless they are in danger."],
-    "Police": ["Move to a safe place and lock the door if you can. Do not follow or confront anyone.",
-               "Note what you can safely remember: faces, clothes, vehicle number, direction they went.",
-               "Keep your phone with you and pick up when the police or helpline calls back."],
-    "Rescue": ["Move away from damaged buildings, walls and electric wires. Do not go inside.",
-               "Never touch a fallen wire or anyone still touching one; keep others at least 10 metres away.",
-               "If someone is trapped, keep talking to them and tap on pipes or walls so rescuers can find them.",
-               "In a flood, move to higher ground and never walk or drive through moving water."],
-}
-HELP_STAGES = ["Report received", "Help assigned", "On the way", "Arrived", "Completed"]
-SCENE_MINUTES = 10
-
-
-def dispatch_help(rep_: dict) -> None:
-    """Send every team the router chose; track the first unit to arrive. Retries teams that were queued."""
-    if not rep_.get("location"):
-        return
-    teams = rep_.get("teams") or []
-    queued = [t_ for t_ in teams if t_.get("unit") is None and DEPARTMENTS[t_["dept"]]["fleet"]]
-    if queued:
-        fresh = dispatch_departments([{k: t_[k] for k in ("dept", "role", "why")} for t_ in queued], rep_["location"], rep_["ref"])
-        for old, new in zip(queued, fresh):
-            if new.get("unit"):
-                old.update(unit=new["unit"], eta=new["eta"], route=new["route"], status="on the way", sent_at=time.time())
-    units = [t_ for t_ in teams if t_.get("unit")]
-    for t_ in units:
-        t_.setdefault("sent_at", time.time())
-    if not units:
-        rep_["status"] = "queued" if any(DEPARTMENTS[t_["dept"]]["fleet"] for t_ in teams) else "notified"
-        return
-    first = min(units, key=lambda t_: t_["sent_at"] + t_["eta"] * sim_seconds)
-    rep_.update(vehicle=first["unit"], eta=first["eta"], assigned_at=first["sent_at"], route=first["route"], status="assigned")
-    for c in st.session_state.calls:
-        if c.get("Call ID") == rep_["call_id"]:
-            c["Help vehicle"] = first["unit"]
-            c["teams"] = [t_["dept"] for t_ in teams]
-
-
-def help_progress(rep_: dict) -> dict:
-    """Where the help is now, from the simulated clock (one simulated minute = `sim_seconds` real seconds)."""
-    if not rep_.get("assigned_at"):
-        return {"stage": 0, "remaining": None, "frac": 0.0}
-    elapsed = (time.time() - rep_["assigned_at"]) / sim_seconds
-    if elapsed < rep_["eta"]:
-        return {"stage": 2 if elapsed > 0.2 else 1, "remaining": rep_["eta"] - elapsed, "frac": elapsed / rep_["eta"]}
-    last = max([rep_["eta"]] + [(t_["sent_at"] - rep_["assigned_at"]) / sim_seconds + t_["eta"]
-                                for t_ in rep_.get("teams", []) if t_.get("unit")])
-    if elapsed < last + SCENE_MINUTES:
-        return {"stage": 3, "remaining": 0.0, "frac": 1.0}
-    if not rep_.get("released"):                                           # every unit is free for new jobs
-        for t_ in rep_.get("teams", []):
-            if t_.get("unit"):
-                st.session_state.used_vehicle_ids.discard(t_["unit"])
-                t_["status"] = "job completed"
-        rep_["released"] = True
-    return {"stage": 4, "remaining": 0.0, "frac": 1.0}
-
-
-def draw_help_map(rep_: dict, frac: float):
-    fig, ax = plt.subplots(figsize=(5.2, 5.2))
-    ax.set_xlim(-0.5, GRID_SIZE - 0.5); ax.set_ylim(-0.5, GRID_SIZE - 0.5); ax.set_aspect("equal")
-    ax.set_xticks([]); ax.set_yticks([]); ax.grid(False)
-    for k in range(GRID_SIZE):
-        ax.axhline(k, color="#cbd4dc", lw=0.6, zorder=0); ax.axvline(k, color="#cbd4dc", lw=0.6, zorder=0)
-    ax.axvspan(9.15, 9.85, color="#c3dcec", zorder=0.5)                   # river between x=9 and x=10
-    for y in (3, 10, 16):
-        ax.plot([9, 10], [y, y], color="#5b6b7a", lw=3, zorder=1)          # bridges
-    for y in closure_rows:
-        ax.axhline(y, color="#d62839", lw=2, ls="--", alpha=.6)
-    for x in closure_cols:
-        ax.axvline(x, color="#d62839", lw=2, ls="--", alpha=.6)
-    colors = {"Police": "#1C5D99", "Fire & Rescue": "#D62839", "Ambulance (EMS)": "#1F8A5B", "Disaster Response": "#C98A0C"}
-    units = [t_ for t_ in rep_.get("teams", []) if t_.get("route")] or (
-        [{"route": rep_["route"], "unit": rep_["vehicle"], "dept": "", "eta": rep_["eta"], "sent_at": rep_.get("assigned_at")}] if rep_.get("route") else [])
-    now = time.time()
-    for t_ in units:
-        route = t_["route"]
-        f = 1.0 if frac >= 1.0 and t_.get("unit") == rep_.get("vehicle") else min(1.0, max(0.0, (now - (t_.get("sent_at") or now)) / sim_seconds / max(t_["eta"], 0.1)))
-        xs, ys = zip(*route)
-        col = colors.get(t_.get("dept"), "#1c5d99")
-        ax.plot(xs, ys, color=col, lw=3, alpha=.8, zorder=2)
-        pos = route[min(len(route) - 1, int(round(f * (len(route) - 1))))]
-        ax.scatter(*pos, s=170, marker="s", color="white", edgecolors=col, linewidths=2.5, zorder=4)
-        ax.annotate(t_["unit"], pos, xytext=(6, 6), textcoords="offset points", fontsize=8, fontweight="bold")
-    if rep_.get("location"):
-        tx, ty = LANDMARKS[rep_["location"]]
-        ax.scatter(tx, ty, s=260, color=SEV_COLOR.get(rep_["severity"], "#d62839"), edgecolors="white", linewidths=2, zorder=3)
-        ax.annotate(rep_["location"], (tx, ty), xytext=(6, -12), textcoords="offset points", fontsize=8)
-    fig.tight_layout()
-    return fig
 
 
 # ----------------------- Speech to text (works even when browser voice typing does not) -----------------------
@@ -1630,6 +1556,148 @@ def _secret(name: str) -> str:
     return os.getenv(name, "")
 
 
+def setup_langsmith():
+    """Switch tracing on only when a LangSmith key is in Secrets; otherwise everything still works, untraced."""
+    key = _secret("LANGSMITH_API_KEY") or _secret("LANGCHAIN_API_KEY")
+    if langsmith is None or not key:
+        os.environ["LANGSMITH_TRACING"] = "false"
+        return None, None
+    os.environ["LANGSMITH_API_KEY"] = key
+    os.environ["LANGSMITH_TRACING"] = "true"
+    project = _secret("LANGSMITH_PROJECT") or "sahayak-112"
+    os.environ["LANGSMITH_PROJECT"] = project
+    if _secret("LANGSMITH_ENDPOINT"):                      # e.g. https://eu.api.smith.langchain.com
+        os.environ["LANGSMITH_ENDPOINT"] = _secret("LANGSMITH_ENDPOINT")
+    try:
+        langsmith.utils.get_env_var.cache_clear()           # make the library re-read the settings above
+    except Exception:
+        pass
+    return _ls_client(key, project, _secret("LANGSMITH_ENDPOINT")), project
+
+
+@st.cache_resource(show_spinner=False)
+def _ls_client(key: str, project: str, endpoint: str):
+    """One LangSmith client for the whole app (not a new one on every click)."""
+    try:
+        return LangSmithClient()
+    except Exception:
+        return None
+
+
+ls_client, ls_project = setup_langsmith()
+
+
+def ls_extra(tag: str, thread: str) -> dict:
+    """Give a trace our own id (to attach feedback later) and group a call's turns as one LangSmith thread."""
+    return {"run_id": uuid.uuid4(), "metadata": {"thread_id": thread, "app": "sahayak-112"}, "tags": [tag]}
+
+
+def send_feedback(run_id: str | None, scores: dict, comment: str = "", correction: dict | None = None) -> str:
+    """Store feedback locally (for the accuracy page) and in LangSmith on the run it judges."""
+    st.session_state.setdefault("feedback_log", []).append({"run_id": run_id, **scores, "comment": comment,
+                                                            "correction": correction, "time": time.strftime("%H:%M:%S")})
+    if ls_client is None or not run_id:
+        return "saved in this session (LangSmith is not connected)"
+    try:
+        for key, val in scores.items():
+            ls_client.create_feedback(run_id, key=key, score=val, comment=comment or None,
+                                      correction=correction if key == "routing_correct" else None)
+        return "saved in this session and sent to LangSmith"
+    except Exception as exc:
+        return f"saved in this session; LangSmith said: {str(exc)[:120]}"
+
+
+# A labelled test set: the answers a trained call-taker would give. Used to measure accuracy on demand.
+TEST_CALLS = [
+    ("Smoke and flames are coming from a building near the Shopping Mall.", ["fire"], ["Fire & Rescue"], 4, "Shopping Mall"),
+    ("Fire at the petrol pump, a man has bad burns on his arms", ["fire"], ["Fire & Rescue", "Ambulance (EMS)"], 4, "Petrol Pump"),
+    ("Strong gas smell from a cylinder in a house near the old temple, nobody hurt", ["gas_leak"], ["Fire & Rescue", "Gas Emergency"], 3, "Old Temple"),
+    ("A person is unconscious and not breathing near Railway Station.", ["medical"], ["Ambulance (EMS)"], 5, "Railway Station"),
+    ("My father fell in the bathroom and his leg is broken, we are near the stadium", ["medical"], ["Ambulance (EMS)"], 3, "Stadium"),
+    ("Bus overturned near the river bridge, many people injured", ["road_accident", "medical"], ["Ambulance (EMS)", "Police"], 5, "River Bridge"),
+    ("Two bikes collided at the bus stand, one rider is bleeding", ["road_accident", "medical"], ["Ambulance (EMS)", "Police"], 4, "Bus Terminal"),
+    ("Several people are trapped after a building collapse in the Industrial Area.", ["collapse"],
+     ["Disaster Response", "Fire & Rescue", "Ambulance (EMS)"], 5, "Industrial Area"),
+    ("Water is rising fast near the river bank, an old man is stuck on his roof", ["flood"], ["Disaster Response"], 4, "River Bank"),
+    ("Two men are robbing a shop near central market, they have knives", ["crime"], ["Police"], 4, "Central Market"),
+    ("Someone snatched my chain near the airport road and my friend is bleeding", ["crime", "medical"], ["Police", "Ambulance (EMS)"], 4, "Airport Road"),
+    ("A woman is being harassed by two men near the shopping mall", ["women_safety"], ["Police", "Women Helpline"], 4, "Shopping Mall"),
+    ("My husband beats me every night, I live near the north school", ["women_safety"], ["Police", "Women Helpline"], 4, "North School"),
+    ("My child is missing since evening near the central market", ["child"], ["Police", "Child Helpline"], 4, "Central Market"),
+    ("A live wire has fallen on the road near the stadium", ["electric"], ["Electricity Board"], 3, "Stadium"),
+    ("A boy got an electric shock from a transformer near the petrol pump", ["electric"], ["Electricity Board", "Ambulance (EMS)"], 4, "Petrol Pump"),
+    ("This is a prank call, there is no emergency", [], [], 1, None),
+    ("मेरे घर में आग लगी है, मंदिर के पास", ["fire"], ["Fire & Rescue"], 4, "Old Temple"),
+    ("बस अड्डे पर एक्सीडेंट हुआ है, दो लोग घायल हैं", ["road_accident", "medical"], ["Ambulance (EMS)", "Police"], 4, "Bus Terminal"),
+    ("Someone collapsed in the market and is not moving", ["medical"], ["Ambulance (EMS)"], 5, "Central Market"),
+]
+
+
+@traceable(run_type="chain", name="Routing under test")
+def predict_routing(text: str) -> dict:
+    """The system's answer for one call, without sending any vehicle (safe to run in a test)."""
+    tri, _ = run_triage(text)
+    route = route_problem(text, tri)
+    return {"problems": sorted(route["problems"]), "departments": sorted(t_["dept"] for t_ in route["teams"]),
+            "lead": route["teams"][0]["dept"] if route["teams"] else None, "severity": int(tri.get("severity", 1)),
+            "location": tri.get("location")}
+
+
+def score_one(out: dict, problems, departments, severity, location) -> dict:
+    p, e = set(out["departments"]), set(departments)
+    prec = len(p & e) / len(p) if p else (1.0 if not e else 0.0)
+    rec = len(p & e) / len(e) if e else (1.0 if not p else 0.0)
+    return {"problem_exact": float(set(out["problems"]) == set(problems)),
+            "departments_exact": float(p == e),
+            "department_f1": 0.0 if prec + rec == 0 else 2 * prec * rec / (prec + rec),
+            "lead_correct": float((out["lead"] or None) == (departments[0] if departments else None)),
+            "severity_within_1": float(abs(out["severity"] - severity) <= 1),
+            "location_correct": float(out["location"] == location)}
+
+
+# LangSmith evaluators: (outputs, reference_outputs) -> score
+def _ref(r):
+    return r["problems"], r["departments"], r["severity"], r["location"]
+
+
+def ev_departments_exact(outputs: dict, reference_outputs: dict) -> dict:
+    return {"key": "departments_exact", "score": score_one(outputs, *_ref(reference_outputs))["departments_exact"]}
+
+
+def ev_department_f1(outputs: dict, reference_outputs: dict) -> dict:
+    return {"key": "department_f1", "score": score_one(outputs, *_ref(reference_outputs))["department_f1"]}
+
+
+def ev_problem_exact(outputs: dict, reference_outputs: dict) -> dict:
+    return {"key": "problem_exact", "score": score_one(outputs, *_ref(reference_outputs))["problem_exact"]}
+
+
+def ev_severity(outputs: dict, reference_outputs: dict) -> dict:
+    return {"key": "severity_within_1", "score": score_one(outputs, *_ref(reference_outputs))["severity_within_1"]}
+
+
+def ev_location(outputs: dict, reference_outputs: dict) -> dict:
+    return {"key": "location_correct", "score": score_one(outputs, *_ref(reference_outputs))["location_correct"]}
+
+
+def run_langsmith_experiment() -> str:
+    """Upload the test set as a LangSmith dataset (once) and run an experiment with the evaluators above."""
+    name = "sahayak-112-routing"
+    if not ls_client.has_dataset(dataset_name=name):
+        ds = ls_client.create_dataset(name, description="Emergency calls with the departments a trained call-taker would send.")
+        ls_client.create_examples(
+            dataset_id=ds.id,
+            inputs=[{"text": t} for t, *_ in TEST_CALLS],
+            outputs=[{"problems": p, "departments": d, "severity": sv, "location": loc} for _, p, d, sv, loc in TEST_CALLS])
+    from langsmith.evaluation import evaluate as ls_evaluate
+    res = ls_evaluate(lambda inputs: predict_routing(inputs["text"]), data=name,
+                             evaluators=[ev_departments_exact, ev_department_f1, ev_problem_exact, ev_severity, ev_location],
+                             experiment_prefix="routing-" + ("groq" if use_groq else "rules"),
+                             metadata={"triage": "groq" if use_groq else "rules", "model": groq_model if use_groq else None},
+                             max_concurrency=0, client=ls_client)
+    return getattr(res, "experiment_name", "experiment created")
+
+
 groq_key = _secret("GROQ_API_KEY")          # add it in Manage app -> Settings -> Secrets to switch on Groq AI
 use_groq = bool(groq_key)
 groq_model = GROQ_FALLBACK_MODEL             # llama-3.3-70b-versatile: the most reliable for triage
@@ -1645,11 +1713,9 @@ if "dispatches" not in st.session_state:
     st.session_state.dispatches = []
 if "used_vehicle_ids" not in st.session_state:
     st.session_state.used_vehicle_ids = set()
-if "help_reports" not in st.session_state:
-    st.session_state.help_reports = []
 
-tab_call, tab_help, tab_dept, tab2 = st.tabs(["📞 Emergency call", "🆘 Emergency Help", "🏢 Departments & agents",
-                                             "🚑 Dispatch board"])
+tab_call, tab_dept, tab_acc, tab2 = st.tabs(["📞 Emergency call", "🏢 Departments & agents", "📊 Accuracy & observability",
+                                            "🚑 Dispatch board"])
 
 with tab_call:
     st.markdown(
@@ -1718,7 +1784,11 @@ with tab_call:
                     if pick:
                         answer = (pick, None)
                 if answer:
-                    caller_says(call, answer[0])
+                    extra_ = ls_extra("emergency-call", call["ref"])
+                    caller_says(call, answer[0], langsmith_extra=extra_)
+                    call.setdefault("run_ids", []).append(str(extra_["run_id"]))
+                    if call["dispatched"] and not call.get("dispatch_run"):
+                        call["dispatch_run"] = str(extra_["run_id"])     # feedback about routing goes on this turn
                     if answer[1]:
                         call["turns"][-2]["audio"] = answer[1]           # the caller's turn keeps its recording
                     st.rerun()
@@ -1734,6 +1804,28 @@ with tab_call:
                 d1, d2 = st.columns(2)
                 d1.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt",
                                    "text/plain", width="stretch")
+                with st.container(border=True):
+                    st.markdown("**Was this call handled correctly?** Your answer measures accuracy"
+                                + (" and is sent to LangSmith." if ls_client else "."))
+                    if call.get("feedback_done"):
+                        st.success("Thanks: " + call["feedback_done"])
+                    else:
+                        ok = st.feedback("thumbs", key=f"fb_ok_{call['ref']}")
+                        sent = [a_["dept"] for a_ in call["assignments"]]
+                        should = st.multiselect("Departments that should have been sent", list(DEPARTMENTS), default=sent,
+                                                key=f"fb_dep_{call['ref']}")
+                        sev_ok = st.select_slider("Correct severity", options=[1, 2, 3, 4, 5], value=call["severity"],
+                                                  key=f"fb_sev_{call['ref']}")
+                        note = st.text_input("Comment (optional)", key=f"fb_note_{call['ref']}")
+                        if st.button("Send feedback", key=f"fb_send_{call['ref']}"):
+                            p_, e_ = set(sent), set(should)
+                            f1 = (2 * len(p_ & e_) / (len(p_) + len(e_))) if (p_ or e_) else 1.0
+                            scores = {"routing_correct": float(ok == 1) if ok is not None else float(p_ == e_),
+                                      "department_f1": round(f1, 3),
+                                      "severity_error": float(abs(call["severity"] - sev_ok))}
+                            call["feedback_done"] = send_feedback(call.get("dispatch_run") or (call.get("run_ids") or [None])[-1],
+                                                                  scores, note, {"departments": should, "severity": sev_ok})
+                            st.rerun()
                 if d2.button("📞 Start a new call", type="primary", width="stretch"):
                     st.session_state.call_closed_seen = True
                     st.session_state.call = None
@@ -1783,201 +1875,6 @@ with tab_call:
                         st.caption("Every agent's decision is on the 🏢 Departments & agents tab.")
             call_panel()
 
-with tab_help:
-    st.markdown(
-        "<div style='background:linear-gradient(135deg,#D62839,#A51D2D);color:#fff;border-radius:18px;padding:18px 22px;margin-bottom:6px'>"
-        "<div style='font-size:1.6rem;font-weight:800'>🆘 Need help now?</div>"
-        "<div style='opacity:.92'>Tell us what happened and where. We find the fastest vehicle on today’s roads and show you when it will arrive.</div>"
-        "</div>", unsafe_allow_html=True)
-    st.markdown("<div style='display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 4px'>" + "".join(
-        f"<a href='tel:{n}' style='text-decoration:none;border:1px solid rgba(128,128,128,.35);border-radius:12px;padding:6px 12px;"
-        f"color:inherit'><b style='color:#D62839'>📞 {n}</b> <span style='opacity:.8'>{label}</span></a>" for n, label in HELPLINES)
-        + "</div>", unsafe_allow_html=True)
-    st.caption("This page is a training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
-
-    left, right = st.columns([1.05, 1], gap="large")
-    with left:
-        with st.container(border=True):
-            st.markdown("#### 1. What happened?")
-            h_kind = st.pills("Type of emergency", list(HELP_TYPES), key="help_kind", label_visibility="collapsed")
-            st.markdown("#### 2. Where are you?")
-            h_place = st.selectbox("Nearest landmark", ["Detect from my words"] + sorted(LANDMARKS), key="help_place")
-            st.markdown("#### 3. Tell us more")
-            with st.expander("🎙️ Speak instead of typing", expanded=False):
-                h_voice = voice_recorder("help", "Record what is happening", groq_key, whisper_model)
-                if h_voice and h_voice.get("new") and h_voice.get("text"):
-                    st.session_state.help_text = h_voice["text"]
-                    h_voice["new"] = False
-            h_text = st.text_area("What is happening? (optional)", key="help_text", height=80,
-                                  placeholder="For example: smoke from the second floor, my neighbour is still inside")
-            h_signs = st.pills("Danger signs", list(DANGER_SIGNS), selection_mode="multi", key="help_signs")
-            h_people = st.number_input("How many people need help?", min_value=0, max_value=200, value=0, step=1, key="help_people",
-                                       help="Leave at 0 if you don't know.")
-            send = st.button("🚨 Send for help", type="primary")
-        if send:
-            words = HELP_TYPES[h_kind][1] if h_kind else ""
-            place = None if h_place == "Detect from my words" else h_place
-            report_text = ". ".join(x for x in [words, (h_text or "").strip(), f"near {place}" if place else "",
-                                                ", ".join(h_signs or [])] if x)
-            if not report_text:
-                st.error("Choose what happened, or say or type a few words, then send.")
-            else:
-                triage, msgs = run_triage(report_text)
-                for kind_, m_ in msgs:
-                    getattr(st, kind_)(m_)
-                triage["is_emergency"] = True                       # someone pressed "Send for help": never dismiss it
-                if h_kind:
-                    triage["incident_type"] = HELP_TYPES[h_kind][0]
-                elif triage.get("incident_type") not in ("Fire", "Rescue", "Medical", "Police"):
-                    triage["incident_type"] = "Medical"
-                if h_signs:
-                    top = max(DANGER_SIGNS[sg] for sg in h_signs)
-                    if top > int(triage.get("severity", 1)):
-                        triage["severity"], triage["severity_reason"] = top, f"you said: {', '.join(h_signs).lower()}"
-                if place:
-                    triage["location"] = place
-                if h_people:
-                    triage["people"] = int(h_people)
-                call_id = f"CALL-{len(st.session_state.calls) + 1:03d}"
-                ref = f"HELP-{len(st.session_state.help_reports) + 1:03d}"
-                voiced = bool(h_voice) and bool(h_voice.get("text")) and (h_text or "").strip() == h_voice.get("text", "")
-                rec_ = add_call(report_text, triage, "Emergency Help", h_voice["engine"] if voiced else None,
-                                h_voice["audio"] if voiced else None)
-                rec_["help_ref"] = ref
-                call_id = rec_["Call ID"]
-                rep_ = {"ref": ref, "call_id": call_id, "created": time.time(), "type": triage["incident_type"],
-                        "severity": int(triage["severity"]), "location": triage.get("location"), "people": triage.get("people"),
-                        "reason": triage.get("severity_reason", ""), "method": triage.get("triage_method", ""),
-                        "text": report_text, "status": "received" if triage.get("location") else "needs_location",
-                        "vehicle": None, "feedback": None}
-                run_ = run_agents(report_text, triage, ref, "Emergency Help", h_voice if voiced else None,
-                                  hint=HELP_TYPES[h_kind][2] if h_kind else None)
-                rep_["teams"] = run_["assignments"]
-                rep_["problem"] = ", ".join(run_["route"]["labels"]) or triage["incident_type"]
-                lead = next((t_["dept"] for t_ in rep_["teams"] if t_["role"] == "lead"), None)
-                if lead == "Police":
-                    rep_["type"] = "Police"
-                rec_["teams"] = [t_["dept"] for t_ in rep_["teams"]]
-                dispatch_help(rep_)
-                st.session_state.help_reports.append(rep_)
-                st.session_state.help_track = ref
-                st.toast(f"Report {ref} sent to " + ", ".join(t_["dept"] for t_ in rep_["teams"]) + ".", icon="🚨")
-
-    with right:
-        reports = st.session_state.help_reports
-        if not reports:
-            with st.container(border=True):
-                st.markdown("#### Your help request")
-                st.info("After you send a report, its reference number, the vehicle on its way and the arrival time appear here.")
-        else:
-            refs = [r_["ref"] for r_ in reports][::-1]                 # newest first
-            track_ref = st.selectbox("Track a report", refs, key="help_track")
-            rep_ = next(r_ for r_ in reports if r_["ref"] == track_ref)
-
-            if rep_["status"] == "needs_location":
-                with st.container(border=True):
-                    st.warning(f"**{rep_['ref']}**: we could not find your location. Which landmark is closest?")
-                    fix = st.selectbox("Nearest landmark", sorted(LANDMARKS), key=f"fix_{rep_['ref']}")
-                    if st.button("Set location and send help", key=f"fixbtn_{rep_['ref']}"):
-                        rep_["location"], rep_["status"] = fix, "received"
-                        for c in st.session_state.calls:
-                            if c.get("Call ID") == rep_["call_id"]:
-                                c["location"] = fix
-                        dispatch_help(rep_)
-                        st.rerun()
-
-            @st.fragment(run_every=1.0)
-            def live_tracking(ref_: str) -> None:
-                r_ = next(x for x in st.session_state.help_reports if x["ref"] == ref_)
-                if r_["status"] == "queued" or any(t_.get("unit") is None and DEPARTMENTS[t_["dept"]]["fleet"]
-                                                   for t_ in r_.get("teams", [])):
-                    dispatch_help(r_)                               # retry: a unit may have become free
-                pr = help_progress(r_)
-                with st.container(border=True):
-                    head = st.columns([3, 1])
-                    title = ["Help is being arranged", "Help assigned", "Help is on the way", "Help has arrived", "Completed"][pr["stage"]]
-                    if r_["status"] == "queued":
-                        title = "Waiting for a free vehicle"
-                    elif r_["status"] == "notified":
-                        title = "Your report was passed to the helpline"
-                    head[0].markdown(f"### {title}")
-                    head[1].markdown(f"<div style='text-align:right;margin-top:12px'><code>{r_['ref']}</code></div>", unsafe_allow_html=True)
-                    if pr["stage"] in (1, 2):
-                        st.markdown(f"<div style='font-size:3rem;font-weight:800;line-height:1'>{max(1, math.ceil(pr['remaining']))}"
-                                    f"<span style='font-size:1rem;font-weight:500;opacity:.75'> min until {r_['vehicle']} arrives</span></div>",
-                                    unsafe_allow_html=True)
-                        st.progress(min(1.0, pr["frac"]))
-                    elif pr["stage"] >= 3:
-                        st.success(f"{r_['vehicle']} reached {r_['location']} after {r_['eta']:.0f} simulated minutes.")
-                    elif r_["status"] == "queued":
-                        st.warning("All suitable vehicles are busy. You are in the queue; the first free one will be sent.")
-                    elif r_["status"] == "notified":
-                        st.info("No vehicle is needed for this problem. The helpline below will call you back shortly.")
-                    steps = st.columns(len(HELP_STAGES))
-                    for k_, (col, name) in enumerate(zip(steps, HELP_STAGES)):
-                        done = k_ <= pr["stage"] and (k_ == 0 or r_.get("vehicle"))
-                        col.markdown(f"<div style='text-align:center;font-size:.8rem'><div style='font-size:1.2rem'>{'🟢' if done else '⚪'}</div>{name}</div>",
-                                     unsafe_allow_html=True)
-                    if r_.get("teams"):
-                        st.markdown("**Teams alerted**  \n" + teams_html(r_["teams"]), unsafe_allow_html=True)
-                    f1, f2, f3 = st.columns(3)
-                    f1.markdown(f"**Emergency**  \n{r_.get('problem') or r_['type']}")
-                    f2.markdown(f"**Severity**  \n<span style='color:{SEV_COLOR.get(r_['severity'])};font-weight:800'>{r_['severity']} of 5</span>",
-                                unsafe_allow_html=True)
-                    f3.markdown(f"**Location**  \n{r_['location'] or 'not found yet'}")
-                    if r_.get("route"):
-                        fig_ = draw_help_map(r_, pr["frac"])
-                        st.pyplot(fig_, width="stretch")
-                        plt.close(fig_)
-                if pr["stage"] >= 3 and not r_.get("_shown_done"):
-                    r_["_shown_done"] = True
-                    st.rerun(scope="app")                           # show the feedback form below
-
-            live_tracking(track_ref)
-
-            with st.container(border=True):
-                st.markdown("#### While you wait")
-                for tip in WHILE_YOU_WAIT.get(rep_["type"], WHILE_YOU_WAIT["Medical"]):
-                    st.markdown(f"- {tip}")
-                st.caption("General safety advice only. Always follow the instructions of the emergency operator.")
-
-            if rep_.get("_shown_done") or help_progress(rep_)["stage"] >= 3:
-                with st.container(border=True):
-                    if rep_.get("feedback"):
-                        fb = rep_["feedback"]
-                        st.success(f"Thank you. You rated this response {'★' * fb['rating']} ({fb['rating']} of 5).")
-                    else:
-                        st.markdown("#### How was the response?")
-                        stars = st.feedback("stars", key=f"stars_{rep_['ref']}")
-                        tags = st.pills("What stood out?", ["Fast response", "Crew was helpful", "Kept me informed",
-                                                           "Took too long", "Hard to explain location", "App was hard to use"],
-                                        selection_mode="multi", key=f"tags_{rep_['ref']}")
-                        comment = st.text_input("Anything else? (optional)", key=f"cmt_{rep_['ref']}")
-                        if st.button("Send feedback", key=f"fbbtn_{rep_['ref']}"):
-                            if stars is None:
-                                st.error("Choose 1 to 5 stars first.")
-                            else:
-                                rep_["feedback"] = {"rating": stars + 1, "tags": tags or [], "comment": comment}
-                                st.rerun()
-
-        if reports:
-            with st.expander(f"📊 Help requests this session ({len(reports)})"):
-                rated = [r_ for r_ in reports if r_.get("feedback")]
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Requests", len(reports))
-                m2.metric("Average travel time", f"{sum(r_['eta'] for r_ in reports if r_.get('eta')) / max(1, sum(1 for r_ in reports if r_.get('eta'))):.1f} min")
-                m3.metric("Average rating", f"{sum(r_['feedback']['rating'] for r_ in rated) / len(rated):.1f} ★" if rated else "–")
-                table = pd.DataFrame([{"Reference": r_["ref"], "Emergency": r_["type"], "Severity": r_["severity"],
-                                       "Location": r_["location"] or "Unknown", "Vehicle": r_["vehicle"] or "waiting",
-                                       "Teams": ", ".join(t_["dept"] for t_ in r_.get("teams", [])),
-                                       "Travel (sim min)": round(r_["eta"], 1) if r_.get("eta") else None,
-                                       "Rating": r_["feedback"]["rating"] if r_.get("feedback") else None,
-                                       "Tags": "; ".join(r_["feedback"]["tags"]) if r_.get("feedback") else "",
-                                       "Comment": r_["feedback"]["comment"] if r_.get("feedback") else ""} for r_ in reports])
-                st.dataframe(table, width="stretch", hide_index=True)
-                st.download_button("Download help requests and feedback (CSV)", table.to_csv(index=False).encode("utf-8"),
-                                   file_name="help_requests.csv", mime="text/csv")
-
 with tab_dept:
     st.subheader("How a call reaches the right team")
     st.caption("Like 112 in India or 911 in the USA: one number, then each agent does one job and passes the call on. "
@@ -1988,7 +1885,7 @@ with tab_dept:
     runs = st.session_state.get("agent_runs", [])
     st.markdown("#### Latest call, step by step")
     if not runs:
-        st.info("Make an **Emergency call** or send a report on **Emergency Help**. Every agent's decision appears here.")
+        st.info("Make an **Emergency call**. Every agent's decision appears here.")
     else:
         pick = st.selectbox("Show the agents' work for", [r_["ref"] for r_ in runs][::-1], key="agent_pick")
         run_ = next(r_ for r_ in runs if r_["ref"] == pick)
@@ -2032,6 +1929,64 @@ with tab_dept:
 | Specialist lines | 1091 women, 1098 child, 1906 gas, 1912 power | Hotlines, utilities, CPS | 👩 🧒 🛢️ ⚡ tickets and call-backs |
 | Supervisor checks unclear calls | Shift supervisor | Supervisor / QA | 🧑‍💼 human in the loop |
 """)
+
+with tab_acc:
+    st.subheader("Accuracy & observability (LangSmith)")
+    if ls_client:
+        st.success(f"LangSmith is connected. Every call is traced in project **{ls_project}**: each agent's input, output and time, "
+                   "with a call's turns grouped as one thread. Open https://smith.langchain.com to explore them.")
+    else:
+        st.info("LangSmith is not connected, so traces are not sent; everything below still works in this session. To connect it, add "
+                "these to **Manage app → Settings → Secrets** and reboot:\n\n"
+                "```toml\nLANGSMITH_API_KEY = \"lsv2_...\"\nLANGSMITH_PROJECT = \"sahayak-112\"\n"
+                "# LANGSMITH_ENDPOINT = \"https://eu.api.smith.langchain.com\"   # only for EU accounts\n```")
+    st.markdown("#### 1. Live accuracy from feedback")
+    fb_ = st.session_state.get("feedback_log", [])
+    if not fb_:
+        st.caption("After an emergency call ends, answer **Was this call handled correctly?** Each answer is a labelled example "
+                   "for measuring accuracy (and is attached to the call's trace in LangSmith).")
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Calls rated", len(fb_))
+        m2.metric("Routed correctly", f"{100 * sum(f['routing_correct'] for f in fb_) / len(fb_):.0f}%")
+        m3.metric("Department F1", f"{sum(f['department_f1'] for f in fb_) / len(fb_):.2f}")
+        m4.metric("Severity error", f"{sum(f['severity_error'] for f in fb_) / len(fb_):.1f}", help="Average distance from the correct severity (0 is perfect).")
+        st.dataframe(pd.DataFrame(fb_).drop(columns=["correction"], errors="ignore"), hide_index=True, width="stretch")
+
+    st.markdown("#### 2. Accuracy test on labelled calls")
+    st.caption(f"{len(TEST_CALLS)} calls with the answers a trained call-taker would give (English, Hindi, mixed problems, a prank and "
+               "one known trap). No vehicle is sent. Run it after every change to the rules, the model or the prompt.")
+    c1, c2 = st.columns(2)
+    if c1.button("▶️ Run accuracy test", type="primary"):
+        rows = []
+        with st.spinner("Testing…"):
+            for text, probs, depts, sev, loc in TEST_CALLS:
+                out = predict_routing(text, langsmith_extra={"tags": ["accuracy-test"], "metadata": {"app": "sahayak-112"}})
+                sc = score_one(out, probs, depts, sev, loc)
+                rows.append({"Call": text, "Expected teams": ", ".join(depts) or "none", "Predicted teams": ", ".join(out["departments"]) or "none",
+                             "Teams ✓": "✅" if sc["departments_exact"] else "❌", "Lead ✓": "✅" if sc["lead_correct"] else "❌",
+                             "Severity (exp/pred)": f"{sev} / {out['severity']}", "Location ✓": "✅" if sc["location_correct"] else "❌",
+                             **{f"_{k}": v for k, v in sc.items()}})
+        st.session_state.acc_rows = rows
+    if ls_client and c2.button("☁️ Run as a LangSmith experiment"):
+        with st.spinner("Uploading the dataset and running the experiment…"):
+            try:
+                st.success(f"Experiment **{run_langsmith_experiment()}** is in LangSmith (Datasets & Experiments → sahayak-112-routing).")
+            except Exception as exc:
+                st.error(f"LangSmith experiment failed: {str(exc)[:200]}")
+    rows = st.session_state.get("acc_rows")
+    if rows:
+        df_ = pd.DataFrame(rows)
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Teams exactly right", f"{100 * df_['_departments_exact'].mean():.0f}%")
+        k2.metric("Department F1", f"{df_['_department_f1'].mean():.2f}")
+        k3.metric("Lead team right", f"{100 * df_['_lead_correct'].mean():.0f}%")
+        k4.metric("Severity within 1", f"{100 * df_['_severity_within_1'].mean():.0f}%")
+        k5.metric("Location right", f"{100 * df_['_location_correct'].mean():.0f}%")
+        st.dataframe(df_[[c for c in df_.columns if not c.startswith("_")]], hide_index=True, width="stretch",
+                     column_config={"Call": st.column_config.TextColumn("Call", width="large")})
+        st.caption("Method: " + ("Groq AI with constrained outputs" if use_groq else "keyword rules")
+                   + ". ❌ rows are the cases to fix next, exactly like an error analysis.")
 
 with tab2:
     st.subheader("Prioritized incident and dispatch board")
