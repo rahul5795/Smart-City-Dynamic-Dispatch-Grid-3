@@ -4,3 +4,4 @@ networkx>=3.2
 pandas>=2.0
 matplotlib>=3.7
 SpeechRecognition>=3.10
+langsmith>=0.3
