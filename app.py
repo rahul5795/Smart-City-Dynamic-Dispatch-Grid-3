@@ -168,13 +168,22 @@ DEFAULT_SEVERITY = {"Fire": 3, "Rescue": 4, "Medical": 3}
 NEGATIONS = ["no one is hurt", "no one hurt", "nobody is hurt", "nobody hurt", "nobody is injured", "no injuries",
              "no one is injured", "not injured", "not hurt"]
 PRANK_PHRASES = ["prank", "fake call", "nothing happened", "test call", "no emergency", "just kidding", "wrong number"]
-NUMBER_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-                "several": 3, "many": 5}
+NUMBER_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+                "several": 3, "many": 5, "a few": 3, "teen": 3, "char": 4, "chaar": 4, "paanch": 5, "panch": 5,
+                "kai log": 3, "bahut log": 5}
+HINDI_NUMBERS = {"एक": 1, "दो": 2, "तीन": 3, "चार": 4, "पांच": 5, "पाँच": 5, "छह": 6, "छः": 6, "सात": 7, "आठ": 8, "नौ": 9, "दस": 10,
+                 "कई": 3, "बहुत सारे": 5, "बहुत लोग": 5}
+DEVANAGARI_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
 
 
 def count_people(t: str) -> int | None:
+    """How many people are hurt or need help: digits (also Hindi digits), English and Hindi number words."""
+    t = re.sub(r"\b(no one|anyone|someone|everyone)\b", " ", t.translate(DEVANAGARI_DIGITS), flags=re.I)
     nums = [int(n) for n in re.findall(r"\b(\d{1,2})\b", t)]
-    nums += [v for w, v in NUMBER_WORDS.items() if re.search(rf"\b{w}\b", t)]
+    nums += [v for w, v in NUMBER_WORDS.items() if re.search(rf"\b{w}\b", t, flags=re.I)]
+    padded = " " + re.sub(r"[।,.!?]", " ", t) + " "
+    nums += [v for w, v in HINDI_NUMBERS.items() if f" {w} " in padded]
+    nums = [n for n in nums if 0 < n < 200]
     return max(nums) if nums else None
 
 
