@@ -145,6 +145,9 @@ VEHICLES = [
     {"Vehicle ID": "POL-04", "Type": "Police Car", "Station": (17, 4)},
 ]
 
+DEMO_LANDMARKS = set(LANDMARKS)      # the demo map's own places (callers can name any other place)
+
+
 def make_city_graph(seed: int = 7) -> nx.Graph:
     rng = random.Random(seed)
     graph = nx.grid_2d_graph(GRID_SIZE, GRID_SIZE)
@@ -960,6 +963,104 @@ def _l(pair: tuple[str, str], hindi: bool) -> str:
     return pair[1] if hindi else pair[0]
 
 
+LOC_CUES = r"(?:near(?:by)?|at|in|on|to|opposite|opp\.?|behind|beside|next to|outside|inside|close to|in front of|" \
+           r"(?:the\s+)?(?:location|address|place) is|i am at|i'm at|we are at|i am near|we are near)"
+LOC_STOP = {"and", "but", "where", "there", "please", "help", "someone", "somebody", "people", "person", "my", "his", "her", "he", "she",
+            "they", "it", "is", "are", "was", "were", "has", "have", "had", "because", "so", "with", "who", "which", "that", "fire",
+            "smoke", "accident", "injured", "trapped", "bleeding", "one", "two", "three", "four", "five", "six", "seven", "eight",
+            "nine", "ten", "hai", "hain", "ho", "raha", "rahi", "lagi", "aag", "hua", "hui", "a", "an", "come", "send", "quickly",
+            "है", "हैं", "में", "आग", "लगी", "हुआ", "जल्दी", "go", "come", "call", "know", "tell", "talk", "be", "do", "see",
+            "take", "get", "me", "us", "you", "them", "him", "to", "of", "want", "need"}
+HI_POST = r"(?:ke paas|ke pass|ke saamne|ke samne|ke peeche|ke piche|ke andar|mein|me|par|pe|के पास|के सामने|के पीछे|के अंदर|में|पर)"
+NOT_A_PLACE = {"mere", "mera", "meri", "hamare", "hamara", "yahan", "wahan", "ghar", "मेरे", "मेरा", "हमारे", "यहाँ", "यहां", "वहाँ",
+               "घर", "kitchen", "room", "home", "house", "my", "our", "this", "here", "there"}
+
+
+def extract_location_text(text: str, pending: str | None = None) -> str | None:
+    """The caller's location exactly as said (no forced match to a list). Returns None when no place was given."""
+    t = " ".join(text.split())
+
+    def tidy(words: list[str]) -> str | None:
+        words = [w for w in words if w]
+        while words and words[0].lower() in ("the", "a", "an"):
+            words = words[1:]
+        place = " ".join(words).strip(" ,.;:-")
+        if not place or all(w.lower().strip(",.") in NOT_A_PLACE | LOC_STOP for w in place.split()):
+            return None
+        return place
+    # English cue: "near India Gate, New Delhi", "at Sector 62 Noida", "my address is …"
+    m = re.search(r"\b" + LOC_CUES + r"\s+(.+)", t, flags=re.I)
+    if m:
+        out, toks = [], m.group(1).split()
+        for k, tok in enumerate(toks):
+            bare = tok.strip(",.!?;:").lower()
+            if bare in LOC_STOP:
+                if out:
+                    break
+                continue                                  # skip leading filler ("to talk to …")
+            out.append(tok.rstrip(".!?;:"))
+            if tok[-1:] in ".!?;" or len(out) >= 8:
+                break
+            if tok.endswith(",") and k + 1 < len(toks) and toks[k + 1].strip(",.").lower() in LOC_STOP:
+                break
+        place = tidy(out)
+        if place:
+            return place
+    # Hindi / Hinglish: "India Gate ke paas", "मंदिर के पास", "Sector 18 mein"
+    m = re.search(r"((?:[^\s,।.]+\s+){0,3}[^\s,।.]+)\s+" + HI_POST + r"(?=\s|$|[,।.])", t, flags=re.I)
+    if m:
+        words = [w for w in m.group(1).split() if w.lower() not in LOC_STOP]
+        place = tidy(words[-4:])
+        if place:
+            return place
+    # answering "where are you?": the whole short answer is the place
+    if pending in ("location", "location_again") and yes_no(t) is None:
+        # keep only the parts that are not about the problem: "aag lagi hai. Red Fort. Mandir" -> "Red Fort, Mandir"
+        parts = [p.strip(" ,") for p in re.split(r"[.!?।]", t) if p.strip(" ,") and not rule_problems(p)]
+        if not parts:
+            return None                                   # the answer was about the problem, not a place
+        t2 = ", ".join(parts)
+        words = re.sub(r"^(?:it is|it's|i am|i'm|we are|the location is|my location is|location|address|पता|जगह)\s+", "", t2, flags=re.I)
+        words = words.strip(" .,!?").split()
+        if 1 <= len(words) <= 10:
+            return tidy(words)
+    return None
+
+
+@st.cache_data(show_spinner=False, max_entries=500, ttl=3600)
+def llm_location(text: str, api_key: str, model: str) -> str | None:
+    """Optional AI help: copy the place name exactly as written. Anything not found word-for-word in the text is rejected."""
+    try:
+        r = Groq(api_key=api_key).chat.completions.create(
+            model=model, temperature=0, max_completion_tokens=120, response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": "Copy the location of the emergency EXACTLY as written in this text (same words, "
+                       'same spelling), or null if no place is given. Reply as JSON {"location": "..."}. Text: ' + repr(text)}])
+        loc = (parse_json_response(r.choices[0].message.content or "").get("location") or "").strip()
+        return loc if loc and loc.lower() in text.lower() else None        # never invent a place
+    except Exception:
+        return None
+
+
+def place_on_demo_map(place: str) -> str | None:
+    """For the simulation only: put the caller's place on the demo grid. A known landmark named in full keeps its spot;
+    anything else gets a stable simulated spot. The caller's words are never replaced."""
+    low = place.lower()
+    known = next((n for n in sorted(DEMO_LANDMARKS, key=len, reverse=True) if n.lower() == low or n.lower() in low), None)
+    if place not in LANDMARKS:
+        if known:
+            LANDMARKS[place] = LANDMARKS[known]
+        else:
+            h = int(hashlib.md5(low.encode("utf-8")).hexdigest(), 16)
+            LANDMARKS[place] = (h % GRID_SIZE, (h // GRID_SIZE) % GRID_SIZE)
+    return known
+
+
+def ensure_place(call: dict | None) -> None:
+    """Re-register the caller's place on the demo map (needed after every rerun)."""
+    if call and call.get("slots", {}).get("location") and call["slots"].get("location_xy"):
+        LANDMARKS.setdefault(call["slots"]["location"], tuple(call["slots"]["location_xy"]))
+
+
 def question_text(call: dict, q: str) -> str:
     """The words for question q (the call-back question confirms the number the system already shows)."""
     sl, hindi = call["slots"], call["hindi"]
@@ -969,6 +1070,12 @@ def question_text(call: dict, q: str) -> str:
                 f"My screen shows your number as {num}. Can the team call you back on this number?")
     if q == "phone" and "phone" in call["asked"]:
         return "किस नंबर पर टीम आपको कॉल करे?" if hindi else "Which number should the team call you on?"
+    if q == "location_confirm":
+        return (f"मैंने जगह “{sl.get('location')}” लिखी है। क्या यह सही है?" if hindi else
+                f"I have the location as “{sl.get('location')}”. Is that correct?")
+    if q == "location" and call.get("loc_rejected"):
+        return ("कृपया जगह फिर से, धीरे-धीरे बताइए: इलाका, सड़क या पास की कोई जानी-पहचानी जगह, और शहर।" if hindi else
+                "Please tell me the location again, slowly: the area, road or a well-known place nearby, and the city.")
     return _l(CALL_Q[q], hindi)
 
 
@@ -1066,9 +1173,32 @@ def extract_into(call: dict, text: str) -> list[str]:
         sl["problems"] = list(dict.fromkeys(sl.get("problems", []) + probs))
         if set(sl["problems"]) - before:
             got.append("problems")
-    place = match_location(text)
-    if place and place != sl.get("location"):
-        sl["location"] = place; got.append("location")
+    if pend == "location_confirm":
+        yn = yes_no(text)
+        if yn is True:
+            sl["location_ok"] = True; got.append("location_ok")
+        elif yn is False:
+            call["loc_rejected"] = True
+            sl["location"], sl["location_ok"] = None, False
+            call["asked"] = [q for q in call["asked"] if q not in ("location", "location_again", "location_confirm")]
+    # the first answer to "what is the location?" may be just a place name
+    pend_loc = "location" if pend == "problem" else pend
+    if pend == "location_confirm" and yes_no(text) is False:
+        rest = re.sub(r"^\s*(no|nope|nahi|nahin|नहीं|ना)[\s,.]*", "", text, flags=re.I)   # "no, it is Sector 18 Noida"
+        text_for_loc, pend_loc = (rest, "location") if rest.strip() else (text, None)
+    else:
+        text_for_loc = text
+    place = extract_location_text(text_for_loc, pend_loc)
+    if not place and use_groq and groq_key and Groq is not None and (pend in ("location", "location_again") or not sl.get("location")):
+        place = llm_location(text.strip(), groq_key, groq_model)
+    if not place and not sl.get("location"):        # a demo-map place named in full (a hint, never a replacement)
+        place = next((n for n in sorted(DEMO_LANDMARKS, key=len, reverse=True) if n.lower() in text.lower()), None)
+    if place and place != sl.get("location") and not (pend == "location_confirm" and yes_no(text) is True):
+        sl["location"], sl["location_ok"] = place, False
+        sl["location_map"] = place_on_demo_map(place)
+        sl["location_xy"] = LANDMARKS[place]
+        call["asked"] = [q for q in call["asked"] if q != "location_confirm"]
+        got.append("location")
     people_ctx = re.search(r"(\d+|\b(one|two|three|four|five|six|seven|eight|nine|ten|several|many|kai|bahut)\b|"
                            r"एक|दो|तीन|चार|पांच|पाँच|छह|सात|आठ|नौ|दस|कई|बहुत)\s*(people|persons?|men|women|kids|children|injured|hurt|"
                            r"trapped|inside|log|लोग|आदमी|व्यक्ति|घायल|बच्चे)", t)
@@ -1150,11 +1280,15 @@ def next_question(call: dict) -> str | None:
         for slot in ("name", "phone"):
             if _needs(call, slot) and slot not in asked:
                 return slot
+    if sl.get("location") and not sl.get("location_ok") and "location_confirm" not in asked and sl.get("problems"):
+        return "location_confirm"
     if not sl.get("problems"):
         return "problem_again" if "problem_again" not in asked and call["turns"] and any(t_["role"] == "caller" for t_ in call["turns"]) else (
             None if "problem_again" in asked else "problem")
     if not sl.get("location"):
         return "location" if "location" not in asked else ("location_again" if "location_again" not in asked else None)
+    if not sl.get("location_ok") and "location_confirm" not in asked:
+        return "location_confirm"
     for p in sl["problems"]:
         for q in PROTOCOL.get(p, []):
             if q not in asked and sl.get(q) is None and not (q == "people" and sl.get("people")):
@@ -1487,6 +1621,7 @@ def cad_dispatch(call: dict, hindi: bool) -> list[str]:
 def check_arrivals(call: dict) -> bool:
     """Connect the call with the teams. The first crew to arrive joins the call and finds the caller; later units join
     them. The call-taker never hangs up on a silent caller (unless "Hand over automatically" is chosen): it checks on them."""
+    ensure_place(call)
     changed, now, c = False, time.time(), cfg()
     units = [a_ for a_ in call.get("assignments", []) if a_.get("unit")]
     for a_ in units:
@@ -1606,6 +1741,7 @@ def hand_over(call: dict, why: str = "Caller confirmed the crew is with them: ca
 def caller_says(call: dict, text: str) -> dict:
     """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
     hindi = call["hindi"]
+    ensure_place(call)
     call["turns"].append({"role": "caller", "text": text.strip(), "t": ist_time()})
     call["last_caller_at"] = time.time()
     call["still_checks"], call["kept_open"] = 0, False          # the caller spoke: they are on the line
@@ -1676,7 +1812,10 @@ def caller_says(call: dict, text: str) -> dict:
     if "problems" in got:
         add_event(call, "🔎", "Problem: " + ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])))
     if "location" in got:
-        add_event(call, "📍", f"Location confirmed: {sl.get('location')}")
+        add_event(call, "📍", f"Location heard: “{sl.get('location')}”" + (f" (demo map: {sl['location_map']})" if sl.get("location_map") else
+                                                                          " (placed on the demo map for simulation)"))
+    if "location_ok" in got:
+        add_event(call, "✅", f"Location confirmed by the caller: “{sl.get('location')}”")
     if "name" in got:
         add_event(call, "🙋", f"Caller: {sl.get('name')}")
     if "phone" in got:
@@ -1696,7 +1835,7 @@ def caller_says(call: dict, text: str) -> dict:
     # dispatch as soon as we know what and where (like a real call-taker, before all questions are done)
     caller_turns = sum(1 for t_ in call["turns"] if t_["role"] == "caller")
     unclear = not sl.get("problems") and sl.get("location") and caller_turns >= 3      # still unclear: police control room takes it
-    if (sl.get("problems") or unclear) and sl.get("location") and not call["dispatched"]:
+    if (sl.get("problems") or unclear) and sl.get("location") and sl.get("location_ok") and not call["dispatched"]:
         rec = add_call(caller_text(call), tri, "Emergency call")
         call["record"] = rec["Call ID"]
         # agents classify and route (traced); the CAD run card decides the actual units
@@ -1832,7 +1971,8 @@ def incident_card_html(c_: dict) -> str:
     facts = [
         fact("What", bool(sl.get("problems")), ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])), "caller",
              pend in ("problem", "problem_again")),
-        fact("Where", bool(sl.get("location")), sl.get("location") or "", "caller", pend in ("location", "location_again")),
+        fact("Where", bool(sl.get("location_ok")), (sl.get("location") or "") + ("" if sl.get("location_ok") or not sl.get("location") else " (to confirm)"),
+             "caller · confirmed" if sl.get("location_ok") else "caller", pend in ("location", "location_again", "location_confirm")),
         fact("How many", bool(sl.get("people")), str(sl.get("people") or ""), sl.get("people_src", "caller"), pend == "people"),
         fact("Danger checked", checked, ", ".join(danger + safe) or ", ".join(answered), "caller", pend in YES_NO),
         fact("Caller", bool(sl.get("name")), sl.get("name") or "", "caller", pend == "name"),
@@ -1850,7 +1990,8 @@ def incident_card_html(c_: dict) -> str:
               f"<span>Received: {ist_stamp(c_['started'])}</span>"
               f"<span>Dialled: {c_.get('dialed', '112')}</span><span>Line: mobile</span>"
               f"<span>Language: {'Hindi' if c_.get('hindi') else 'English'}</span>"
-              f"<span>Location (ALI): {'from caller' if sl.get('location') else 'not available: ask the caller'}</span></div>")
+              f"<span>Location (ALI): {'from caller' if sl.get('location') else 'not available: ask the caller'}</span>"
+              + (f"<span>Demo map: {sl['location_map'] or 'simulated spot'}</span>" if sl.get("location") else "") + "</div>")
     desc = (sl.get("child_desc") or "") + " " + (sl.get("description") or "")
     html = [CARD_CSS, "<div class='ic'>",
             f"<div class='ic-h'><span style='font-size:1.3rem'>📋</span><div><b>What the call-taker knows</b><br>"
@@ -1932,6 +2073,8 @@ def call_transcript(call: dict) -> str:
     for t_ in call["turns"]:
         who = {"agent": "Call-taker", "caller": "Caller"}.get(t_["role"], t_.get("who", "Crew"))
         lines.append(f"[{t_['t']}] {who}: {t_['text']}")
+        if t_.get("raw") and t_["raw"].strip() != t_["text"].strip():
+            lines.append(f"            (speech-to-text heard: {t_['raw']})")
     sl = call["slots"]
     lines += ["", "Summary:", f"  Problem: {', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or 'unclear'}",
               f"  Location: {sl.get('location') or 'unknown'}", f"  Severity: {call['severity']} of 5", f"  People: {sl.get('people') or 'not stated'}",
@@ -1942,9 +2085,10 @@ def call_transcript(call: dict) -> str:
 
 # ----------------------- Speech to text (works even when browser voice typing does not) -----------------------
 VOICE_LANGS = {"English (India)": "en-IN", "हिन्दी (Hindi)": "hi-IN"}
-WHISPER_HINT = ("Emergency call in an Indian city. Words that may appear: fire, smoke, accident, injured, trapped, "
-                "building collapse, flood, gas leak, ambulance, hospital, police station, bus stand, railway station, "
-                "market, mandir, masjid, gurudwara, chowk, thana.")
+WHISPER_HINT = ("Emergency call in India, in Indian English, Hindi or Hinglish. Write exactly what is said, including any "
+                "place name, even if unfamiliar: cities such as New Delhi, Ghaziabad, Noida, Gurugram, Bengaluru, Hyderabad, "
+                "Mumbai, Kolkata, Chennai, Thiruvananthapuram; places such as India Gate, sector, chowk, mandir, masjid, "
+                "gurudwara, thana, railway station, bus stand, hospital.")
 
 
 def wav_stats(wav: bytes) -> dict:
@@ -2624,7 +2768,8 @@ with tab_call:
     else:
         check_arrivals(call)
         if not call["ended"]:
-            bar1, bar2, bar3, bar4 = st.columns([3.2, 1.1, 1.1, 1.1])
+            bar1, bar2, bar3, bar5, bar4 = st.columns([3.0, 1.0, 1.0, 1.1, 1.0])
+            bar5.toggle("✍️ Review", value=False, key="call_review", help="Check and edit what speech-to-text heard before it is sent.")
             bar1.markdown(f"<div class='callbar'><span class='dot'></span><div><b>Connected · {call.get('dialed', '112')} · "
                           f"since {ist_time(call['started'])} IST</b><br>"
                           f"<span>112 Emergency Response Centre · Caller ID (ANI) {call.get('ani', 'withheld')}</span></div></div>",
@@ -2648,6 +2793,8 @@ with tab_call:
                     with st.chat_message("assistant" if t_["role"] == "agent" else "user",
                                          avatar="🧑‍💼" if t_["role"] == "agent" else "🙋"):
                         st.markdown(t_["text"])
+                        if t_.get("raw") and t_["raw"].strip() != t_["text"].strip():
+                            st.caption(f"Heard as: “{t_['raw']}”")
                         if t_.get("audio"):
                             st.audio(t_["audio"], format="audio/wav")
             lang = "hi-IN" if call["hindi"] else "en-IN"
@@ -2664,23 +2811,41 @@ with tab_call:
                     if done and done.get("id") != st.session_state.get("call_live_id"):
                         st.session_state.call_live_id = done["id"]
                         audio = base64.b64decode(done["audio"]) if done.get("audio") else None
-                        text = clean_heard((done.get("text") or "").strip(), call)
+                        raw = (done.get("text") or "").strip()
+                        text = clean_heard(raw, call)
                         if not text and audio and wav_stats(audio)["peak"] >= 0.01:
                             try:
                                 text, _eng = transcribe_audio(audio, lang, groq_key, whisper_model)
                             except RuntimeError:
                                 text = ""
-                        if text:
-                            answer = (text, audio)
+                        if text and st.session_state.get("call_review", False):
+                            st.session_state.call_draft = {"text": text, "audio": audio, "raw": raw, "id": done["id"]}
+                        elif text:
+                            answer = (text, audio, raw)
                         else:
                             agent_say(call, _l(SAY["not_heard"], call["hindi"]))
                             st.rerun()
+                draft = st.session_state.get("call_draft")
+                if draft:
+                    with st.container(border=True):
+                        st.markdown("**✍️ Check what was heard before sending**")
+                        fixed = st.text_area("Recognised words (edit if needed)", value=draft["text"], key=f"draft_{draft['id']}", height=70)
+                        if draft["raw"] and draft["raw"] != draft["text"]:
+                            st.caption(f"Raw speech-to-text: “{draft['raw']}”")
+                        k1, k2 = st.columns(2)
+                        if k1.button("Send", type="primary", key=f"draft_send_{draft['id']}", width="stretch"):
+                            answer = (fixed.strip(), draft["audio"], draft["raw"])
+                            st.session_state.call_draft = None
+                        if k2.button("Discard and speak again", key=f"draft_drop_{draft['id']}", width="stretch"):
+                            st.session_state.call_draft = None
+                            st.rerun()
                 typed = st.chat_input("Or type your answer…", key="call_typed")
                 if typed:
-                    answer = (typed, None)
+                    answer = (typed, None, typed)
                 if call.get("pending") == "location_again" or (call["slots"].get("problems") and not call["slots"].get("location")
                                                                and "location_again" in call["asked"]):
-                    pick = st.selectbox("Pick the nearest landmark", [""] + sorted(LANDMARKS), key=f"call_pick_{len(call['turns'])}")
+                    pick = st.selectbox("Optional: pick a known place (you can also just say or type any place)",
+                                        [""] + sorted(n for n in LANDMARKS if n in DEMO_LANDMARKS), key=f"call_pick_{len(call['turns'])}")
                     if pick:
                         answer = (pick, None)
                 if answer:
@@ -2689,8 +2854,11 @@ with tab_call:
                     call.setdefault("run_ids", []).append(str(extra_["run_id"]))
                     if call["dispatched"] and not call.get("dispatch_run"):
                         call["dispatch_run"] = str(extra_["run_id"])     # feedback about routing goes on this turn
-                    if answer[1]:
-                        call["turns"][-2]["audio"] = answer[1]           # the caller's turn keeps its recording
+                    mine = next((t_ for t_ in reversed(call["turns"]) if t_["role"] == "caller"), None)
+                    if mine is not None:
+                        if answer[1]:
+                            mine["audio"] = answer[1]                   # the caller's turn keeps its recording
+                        mine["raw"] = answer[2] if len(answer) > 2 else answer[0]   # exactly what speech-to-text produced
                     st.rerun()
                 st.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt", "text/plain")
             else:
