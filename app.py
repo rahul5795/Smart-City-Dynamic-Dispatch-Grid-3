@@ -868,7 +868,8 @@ CALL_Q = {   # slot -> (English, Hindi)
                    "बच्चे की उम्र क्या है, उसने क्या पहना है, और आखिरी बार कहाँ देखा गया?"),
     "touching_wire": ("Is anyone touching the wire or hurt by it?", "क्या कोई तार को छू रहा है या उससे घायल है?"),
     "people": ("How many people are hurt or need help?", "कितने लोग घायल हैं या मदद चाहिए?"),
-    "name": ("What is your name, so the team can call you back on this number?", "आपका नाम क्या है, ताकि टीम आपको इसी नंबर पर कॉल कर सके?"),
+    "name": ("What is your name?", "आपका नाम क्या है?"),
+    "phone": ("What number can the team call you back on, if the line drops?", "अगर कॉल कट जाए तो टीम आपको किस नंबर पर वापस कॉल करे?"),
 }
 PROTOCOL = {   # problem -> the questions a call-taker asks next, in order
     "medical": ["breathing", "bleeding", "people"], "road_accident": ["breathing", "bleeding", "trapped", "people"],
@@ -941,6 +942,13 @@ def add_event(call: dict, icon: str, text: str) -> None:
 
 def agent_say(call: dict, text: str) -> None:
     call["turns"].append({"role": "agent", "text": text, "t": time.strftime("%H:%M:%S")})
+    call["last_prompt_at"] = time.time()
+
+
+def crew_say(call: dict, a_: dict, text: str) -> None:
+    """A crew member speaks in the call (three-way call: caller, call-taker, crew)."""
+    call["turns"].append({"role": "crew", "who": f"{a_['icon']} {a_['unit']} crew", "text": text, "t": time.strftime("%H:%M:%S")})
+    call["last_prompt_at"] = time.time()
 
 
 def caller_text(call: dict) -> str:
@@ -957,7 +965,14 @@ def extract_into(call: dict, text: str) -> list[str]:
         yn = yes_no(text)
         if yn is not None:
             sl[pend] = yn; got.append(pend)
-    elif pend in ("description", "child_desc", "name") and len(text.strip()) > 1 and yes_no(text) is not False:
+    elif pend == "phone":
+        digits = re.sub(r"\D", "", text.translate(DEVANAGARI_DIGITS))
+        if len(digits) >= 10:
+            sl["phone"] = digits[-10:]; got.append("phone")
+        elif yes_no(text) is False or any(u in t for u in UNSURE):
+            sl["phone"] = "not given"; got.append("phone")
+    elif pend in ("description", "child_desc", "name") and len(text.strip()) > 1 and yes_no(text) is not False \
+            and (pend != "name" or looks_like_name(text)):
         val = text.strip()
         if pend == "name":
             m_ = re.search(r"(?:my name is|name is|i am|i'm|this is|mera naam|मेरा नाम)\s+([^\d,.!?।]+)", val, flags=re.I)
@@ -1011,11 +1026,36 @@ def call_triage(call: dict) -> dict:
     return tri
 
 
+def _needs(call: dict, slot: str) -> bool:
+    c, sl, asked = cfg(), call["slots"], call["asked"]
+    if slot == "name":
+        return c["name_when"] != "off" and not sl.get("name") and asked.count("name") < 2
+    if slot == "phone":
+        return c["ask_phone"] and not sl.get("phone") and asked.count("phone") < 2 and bool(sl.get("name") or "name" in asked or c["name_when"] == "off")
+    return False
+
+
 def next_question(call: dict) -> str | None:
     sl, asked = call["slots"], call["asked"]
+    c = cfg()
     units = [a_ for a_ in call.get("assignments", []) if a_.get("unit")]
+    if c["arrival"] == "crew" and any(a_.get("arrived") for a_ in units):
+        if not call.get("crew_contact"):
+            return "crew_locate"
+        for slot in ("name", "phone"):
+            if _needs(call, slot) and slot not in asked:
+                return slot
+        return "anything_else"
     if units and all(a_.get("arrived") for a_ in units):
-        return "handover_confirm"                     # the crew is there: only the hand-over is left
+        # the crew is there: collect who to call back (if still missing), then hand over
+        for slot in ("name", "phone"):
+            if _needs(call, slot) and slot not in asked:
+                return slot
+        return "handover_confirm"
+    if call["dispatched"] and c["name_when"] == "early":
+        for slot in ("name", "phone"):
+            if _needs(call, slot) and slot not in asked:
+                return slot
     if not sl.get("problems"):
         return "problem_again" if "problem_again" not in asked and call["turns"] and any(t_["role"] == "caller" for t_ in call["turns"]) else (
             None if "problem_again" in asked else "problem")
@@ -1025,17 +1065,76 @@ def next_question(call: dict) -> str | None:
         for q in PROTOCOL.get(p, []):
             if q not in asked and sl.get(q) is None and not (q == "people" and sl.get("people")):
                 return q
-    if "name" not in asked:
-        return "name"
+    for slot in ("name", "phone"):
+        if _needs(call, slot) and slot not in asked:
+            return slot
     return None
 
 
 ETA_WORDS = ["how long", "how much time", "when will", "where is the", "eta", "are they coming", "kitni der", "kab aayega",
              "kab ayega", "kab aayegi", "कितनी देर", "कब आएगी", "कब आएगा", "कब तक", "कहाँ है", "कहां है"]
-HANDOVER_WAIT = 45          # seconds to wait for the caller's confirmation before closing the call
+CALL_DEFAULTS = {
+    "name_when": "early",       # early: right after help is sent | end: after the protocol questions | off
+    "ask_phone": True,          # ask for a call-back number after the name
+    "arrival": "crew",          # crew: the crew joins the call and finds the caller | confirm: ask "can you see them?" |
+                                # stay: never close by itself | auto: close when all arrive
+    "announce": True,           # tell the caller in the call when each unit arrives
+    "wait": 30,                 # seconds of silence before the call-taker checks on the caller (never hangs up on them)
+    "speed": 6.0,               # real seconds per simulated minute of travel (a 7-minute trip = 42 s of talking)
+}
+
+
+def cfg() -> dict:
+    """The call settings chosen in "⚙️ Call settings" (defaults above)."""
+    return {**CALL_DEFAULTS, **st.session_state.get("call_cfg", {})}
+CALL_Q.update({
+    "crew_locate": ("Please tell the crew exactly where you are: a gate, shop, floor, or what you are wearing.",
+                    "कृपया टीम को ठीक-ठीक बताइए आप कहाँ हैं: गेट, दुकान, मंज़िल, या आपने क्या पहना है।"),
+    "anything_else": ("The crew is with you now. Is there anything else I can help with?",
+                      "टीम अब आपके पास है। क्या मैं और किसी चीज़ में मदद कर सकता हूँ?"),
+})
+CREW_SAY = {
+    "hello": ("Hello{name}, this is the {dept} crew from {unit}. We have reached {place}. Where exactly are you? "
+              "Tell us a gate, shop, floor, or what you are wearing.",
+              "नमस्ते{name}, मैं {unit} से {dept} टीम बोल रहा हूँ। हम {place} पहुँच गए हैं। आप ठीक-ठीक कहाँ हैं? "
+              "गेट, दुकान, मंज़िल, या आपने क्या पहना है, बताइए।"),
+    "found": ("Thank you{name}. We can see you now. Stay where you are, we are coming to you.",
+              "धन्यवाद{name}। हम आपको देख पा रहे हैं। वहीं रहिए, हम आपके पास आ रहे हैं।"),
+    "search": ("No problem. Keep your phone on, and wave or shout if you can. We are searching near {place}.",
+               "कोई बात नहीं। फ़ोन चालू रखिए, और हो सके तो हाथ हिलाइए या आवाज़ दीजिए। हम {place} के पास ढूँढ रहे हैं।"),
+    "joined": ("{unit} is here too and joining the {lead} crew.", "{unit} भी पहुँच गई है और {lead} टीम के साथ जुड़ रही है।"),
+}
+DONE_WORDS = ["no", "nothing", "that's all", "thats all", "thank you", "thanks", "bas", "nahi", "nahin", "dhanyavad", "shukriya",
+              "नहीं", "बस", "धन्यवाद", "शुक्रिया", "कुछ नहीं"]
+SAY.update({
+    "still_there": ("Are you still on the line? Say anything, or tap the microphone, so I know you are okay.",
+                    "क्या आप अभी लाइन पर हैं? कुछ भी बोलिए, ताकि मुझे पता चले आप ठीक हैं।"),
+    "kept_open": ("I will keep this line open. The crew is at {place} and is looking for you.",
+                  "मैं यह लाइन खुली रखूँगा। टीम {place} पर है और आपको ढूँढ रही है।"),
+})
+
+
+def _name_bit(call: dict) -> str:
+    n = call["slots"].get("name")
+    return f" {n}" if n else ""
+
+
+def looks_like_name(text: str) -> bool:
+    """A reply to "what is your name?" that is really a name (not "he stopped breathing")."""
+    if re.search(r"(?:my name is|name is|i am|i'm|this is|mera naam|मेरा नाम)", text, flags=re.I):
+        return True
+    words = [w for w in re.sub(r"[,.!?।]", " ", text.lower()).split() if w not in ("है", "hai", "hoon", "हूँ", "हूं", "ji", "जी")]
+    not_name = {"he", "she", "they", "it", "is", "are", "has", "have", "was", "the", "not", "please", "help", "breathing", "bleeding",
+                "trapped", "stuck", "fire", "smoke", "hurt", "injured", "dying", "dead", "coming", "where", "वह", "वो", "हैं", "नहीं",
+                "मदद", "आग", "खून", "फँसा", "फंसा", "साँस", "सांस", "कहाँ"}
+    return (1 <= len(words) <= 4 and not re.search(r"\d", text) and not rule_problems(text) and not set(words) & not_name
+            and yes_no(text) is None and not any(w in text.lower() for w in ETA_WORDS))
+
+
 SEE_TEAM_WORDS = ["they are here", "they're here", "with me", "i can see", "arrived", "reached", "aa gaye", "aa gayi", "pahunch",
                   "आ गए", "आ गई", "आ गयी", "पहुँच", "पहुंच", "दिख रहे", "दिख रही"]
 SAY.update({
+    "before_handover": ("The team is with you now. Before I hand you over:", "टीम अब आपके पास है। आपको सौंपने से पहले:"),
     "handover_q": ("All teams have reached {place}. Can you see them? Say yes when they are with you.",
                    "सभी टीमें {place} पहुँच गई हैं। क्या आप उन्हें देख पा रहे हैं? जब वे आपके पास हों तो हाँ बोलिए।"),
     "not_found": ("Stay where you are and keep your phone on. I have told the team to look for you near {place}. "
@@ -1056,7 +1155,7 @@ SAY.update({
 def unit_left(a_: dict, now: float | None = None) -> float:
     """Simulated minutes until this unit arrives (0 when it is there)."""
     now = now or time.time()
-    return max(0.0, a_["eta"] - (now - a_.get("sent_at", now)) / sim_seconds)
+    return max(0.0, a_["eta"] - (now - a_.get("sent_at", now)) / a_.get("speed", sim_seconds))
 
 
 def eta_reply(call: dict) -> str:
@@ -1072,37 +1171,73 @@ def eta_reply(call: dict) -> str:
 
 
 def check_arrivals(call: dict) -> bool:
-    """Connect the call with the teams: announce each arrival in the call, then hand over when everyone is there."""
-    changed, now = False, time.time()
+    """Connect the call with the teams. The first crew to arrive joins the call and finds the caller; later units join
+    them. The call-taker never hangs up on a silent caller (unless "Hand over automatically" is chosen): it checks on them."""
+    changed, now, c = False, time.time(), cfg()
     units = [a_ for a_ in call.get("assignments", []) if a_.get("unit")]
     for a_ in units:
         if not a_.get("arrived") and unit_left(a_, now) <= 0:
             a_["arrived"], changed = True, True
             add_event(call, a_["icon"], f"{a_['unit']} ({a_['dept']}) arrived")
-            if not call["ended"]:
-                agent_say(call, _l(SAY["arrived"], call["hindi"]).format(
-                    icon=a_["icon"], unit=a_["unit"], dept=a_["dept"], place=call["slots"].get("location") or "you"))
+            if call["ended"]:
+                continue
+            place = call["slots"].get("location") or "you"
+            if c["arrival"] == "crew" and not call.get("crew_unit"):
+                # the first crew on scene joins the call (like a real crew phoning the caller)
+                call["crew_unit"] = a_["unit"]
+                call["resume_q"] = call.get("pending")
+                if c["announce"]:
+                    agent_say(call, _l(SAY["arrived"], call["hindi"]).format(icon=a_["icon"], unit=a_["unit"], dept=a_["dept"], place=place))
+                crew_say(call, a_, _l(CREW_SAY["hello"], call["hindi"]).format(name=_name_bit(call), dept=a_["dept"], unit=a_["unit"], place=place))
+                call["pending"] = "crew_locate"
+                add_event(call, "🎧", f"{a_['unit']} crew joined the call")
+            elif c["arrival"] == "crew" and call.get("crew_unit"):
+                lead = next((u for u in units if u["unit"] == call["crew_unit"]), a_)
+                if call.get("crew_contact"):
+                    a_["contact"] = True
+                if c["announce"]:
+                    agent_say(call, _l(CREW_SAY["joined"], call["hindi"]).format(unit=f"{a_['icon']} {a_['unit']}", lead=lead["dept"]))
+            elif c["announce"]:
+                agent_say(call, _l(SAY["arrived"], call["hindi"]).format(icon=a_["icon"], unit=a_["unit"], dept=a_["dept"], place=place))
     all_there = bool(units) and all(a_.get("arrived") for a_ in units)
-    if all_there and not call["ended"] and not call.get("handover_asked"):
-        # like a real call-taker: stay on the line until the caller confirms the crew is with them
-        call["handover_asked"], call["pending"] = now, "handover_confirm"
-        agent_say(call, _l(SAY["handover_q"], call["hindi"]).format(place=call["slots"].get("location") or "you"))
-        add_event(call, "📣", "All teams on scene: asking the caller to confirm contact")
+    if c["arrival"] != "crew" and all_there and not call["ended"] and not call.get("handover_asked"):
+        call["handover_asked"] = now
+        add_event(call, "📣", "All teams on scene")
+        missing = [slot for slot in ("name", "phone") if _needs(call, slot)]
+        if c["arrival"] == "auto" and not missing:
+            hand_over(call, "All teams on scene: call handed over automatically")
+        elif missing and call.get("pending") not in missing:
+            call["pending"] = missing[0]; call["asked"].append(missing[0])
+            agent_say(call, _l(SAY["before_handover"], call["hindi"]) + " " + _l(CALL_Q[missing[0]], call["hindi"]))
+        elif not missing:
+            call["pending"] = "handover_confirm"
+            agent_say(call, _l(SAY["handover_q"], call["hindi"]).format(place=call["slots"].get("location") or "you"))
         changed = True
-    elif all_there and not call["ended"] and call.get("handover_asked") and now - call["handover_asked"] > HANDOVER_WAIT \
-            and call["turns"][-1]["role"] == "agent":
-        # no answer for a while: the crew is on scene, so close the call politely
-        agent_say(call, _l(SAY["handover"], call["hindi"]).format(ref=call["ref"]))
-        call["ended"], call["ended_by"], call["ended_at"] = True, "handover", now
-        add_event(call, "🤝", "No reply after the teams arrived: call handed over")
-        changed = True
+    # a silent caller: check on them; only "Hand over automatically" may close the call by itself
+    arrived_any = any(a_.get("arrived") for a_ in units)
+    if arrived_any and not call["ended"] and call["turns"] and call["turns"][-1]["role"] != "caller":
+        quiet = now - max(call.get("last_prompt_at", 0), call.get("last_caller_at", 0))
+        if quiet > c["wait"]:
+            if c["arrival"] == "auto" and all_there:
+                hand_over(call, "No reply after the teams arrived: call handed over automatically")
+                changed = True
+            elif call.get("still_checks", 0) < 2:
+                call["still_checks"] = call.get("still_checks", 0) + 1
+                agent_say(call, _l(SAY["still_there"], call["hindi"]))
+                add_event(call, "🔔", "Caller silent: checking they are still on the line")
+                changed = True
+            elif not call.get("kept_open"):
+                call["kept_open"] = True
+                agent_say(call, _l(SAY["kept_open"], call["hindi"]).format(place=call["slots"].get("location") or "you"))
+                add_event(call, "📶", "Caller still silent: line kept open while the crew searches")
+                changed = True
     return changed
 
 
-def hand_over(call: dict) -> None:
+def hand_over(call: dict, why: str = "Caller confirmed the crew is with them: call handed over") -> None:
     agent_say(call, _l(SAY["handover"], call["hindi"]).format(ref=call["ref"]))
     call["ended"], call["ended_by"], call["ended_at"], call["pending"] = True, "handover", time.time(), None
-    add_event(call, "🤝", "Caller confirmed the crew is with them: call handed over")
+    add_event(call, "🤝", why)
 
 
 @traceable(run_type="chain", name="Call-taker turn",
@@ -1112,6 +1247,36 @@ def caller_says(call: dict, text: str) -> dict:
     """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
     hindi = call["hindi"]
     call["turns"].append({"role": "caller", "text": text.strip(), "t": time.strftime("%H:%M:%S")})
+    call["last_caller_at"] = time.time()
+    call["still_checks"], call["kept_open"] = 0, False          # the caller spoke: they are on the line
+    if call.get("pending") == "crew_locate":
+        crew = next((a_ for a_ in call["assignments"] if a_.get("unit") == call.get("crew_unit")), None)
+        yn = yes_no(text)
+        if crew and (yn is False or any(u in text.lower() for u in UNSURE)) and len(text.split()) <= 4:
+            crew_say(call, crew, _l(CREW_SAY["search"], hindi).format(place=call["slots"].get("location") or "you"))
+            add_event(call, "🔦", "Caller could not describe the spot: crew searching")
+            return {"reply": call["turns"][-1]["text"], "understood": ["crew_search"], "severity": call["severity"]}
+        if crew:
+            # the caller described where they are: the crew finds them
+            call["crew_contact"] = True
+            for a_ in call["assignments"]:
+                if a_.get("arrived"):
+                    a_["contact"] = True
+            crew_say(call, crew, _l(CREW_SAY["found"], hindi).format(name=_name_bit(call)))
+            add_event(call, "🤝", f"{crew['unit']} crew reached the caller: {text.strip()[:60]}")
+            extract_into(call, text)                     # the description may also carry new facts
+            q = next_question(call)
+            call["pending"] = q
+            if q:
+                call["asked"].append(q)
+                agent_say(call, _l(CALL_Q[q], hindi))
+            return {"reply": call["turns"][-1]["text"], "understood": ["crew_contact"], "severity": call["severity"]}
+    if call.get("pending") == "anything_else":
+        low = " " + re.sub(r"[^\w\u0900-\u097F' ]", " ", text.lower()) + " "
+        if any(f" {w} " in low for w in DONE_WORDS) and not rule_problems(text):
+            hand_over(call, "Caller needed nothing more: call handed over to the crew")
+            return {"reply": call["turns"][-1]["text"], "understood": ["done"], "severity": call["severity"]}
+        call["pending"] = None                       # new information: handle it as a normal turn, then ask again
     if call.get("pending") == "handover_confirm":
         low = text.lower()
         yn = yes_no(text)                            # check "no" first: "नहीं दिख रहे" is a no, not a yes
@@ -1143,6 +1308,8 @@ def caller_says(call: dict, text: str) -> dict:
         add_event(call, "📍", f"Location confirmed: {sl.get('location')}")
     if "name" in got:
         add_event(call, "🙋", f"Caller: {sl.get('name')}")
+    if "phone" in got:
+        add_event(call, "📱", "Call-back number: " + (sl["phone"] if sl["phone"] == "not given" else "••••••" + sl["phone"][-4:]))
     if "problems" in got or "location" in got:
         what = ", ".join((PROBLEM_HI.get(p, PROBLEMS[p]["label"]) if hindi else PROBLEMS[p]["label"].lower())
                          for p in sl.get("problems", [])) or ("आपात स्थिति" if hindi else "an emergency")
@@ -1163,7 +1330,7 @@ def caller_says(call: dict, text: str) -> dict:
         call["record"] = rec["Call ID"]
         run_ = run_agents(caller_text(call), tri, call["ref"], "Emergency call", hint=(sl.get("problems") or [None])[0])
         for a_ in run_["assignments"]:
-            a_["sent_at"] = time.time()
+            a_["sent_at"], a_["speed"] = time.time(), cfg()["speed"]
         call["assignments"], call["dispatched"] = run_["assignments"], True
         add_event(call, "🚨", "Dispatched: " + ", ".join(f"{a_['dept']} {a_.get('unit') or a_.get('ticket') or ''}".strip()
                                                        for a_ in run_["assignments"]))
@@ -1184,7 +1351,7 @@ def caller_says(call: dict, text: str) -> dict:
         if extra:
             more = dispatch_departments(extra, sl.get("location"), call["ref"])
             for a_ in more:
-                a_["sent_at"] = time.time()
+                a_["sent_at"], a_["speed"] = time.time(), cfg()["speed"]
             call["assignments"] += more
             st.session_state.setdefault("dept_jobs", []).extend(
                 {**{k: v for k, v in a_.items() if k != "route"}, "problem": ", ".join(route["labels"]), "location": sl.get("location"),
@@ -1213,6 +1380,11 @@ def caller_says(call: dict, text: str) -> dict:
         agent_say(call, " ".join(p for p in parts if p) + " " + _l(SAY["yes_no_again"], hindi) + " " + _l(CALL_Q[pend], hindi))
         return {"reply": call["turns"][-1]["text"], "understood": got, "severity": call["severity"], "reasked": pend}
     q = next_question(call)
+    if q == "handover_confirm" and cfg()["arrival"] == "auto":
+        if parts:
+            agent_say(call, " ".join(p for p in parts if p))
+        hand_over(call, "Caller details collected and all teams on scene: call handed over automatically")
+        return {"reply": call["turns"][-1]["text"], "understood": got, "severity": call["severity"]}
     if q == "handover_confirm":
         call["handover_asked"], call["pending"] = time.time(), "handover_confirm"
         parts.append(_l(SAY["handover_q"], hindi).format(place=sl.get("location") or "you"))
@@ -1286,7 +1458,11 @@ def incident_card_html(c_: dict) -> str:
     # information completeness: the five facts a call-taker needs
     checked = any(sl.get(k) is not None for k in YES_NO)
     facts = [("What", bool(sl.get("problems"))), ("Where", bool(sl.get("location"))), ("How many", bool(sl.get("people"))),
-             ("Danger checked", checked), ("Caller", bool(sl.get("name")))]
+             ("Danger checked", checked)]
+    if cfg()["name_when"] != "off":
+        facts.append(("Caller", bool(sl.get("name"))))
+    if cfg()["ask_phone"]:
+        facts.append(("Call-back no.", bool(sl.get("phone")) and sl.get("phone") != "not given"))
     pct = round(100 * sum(ok for _, ok in facts) / len(facts))
     fact_chips = "".join(f"<span class='chip {'green' if ok else ''}'>{'✓' if ok else '○'} {name}</span>" for name, ok in facts)
     desc = (sl.get("child_desc") or "") + " " + (sl.get("description") or "")
@@ -1299,7 +1475,9 @@ def incident_card_html(c_: dict) -> str:
             f"<div class='f'><div class='k'>🔥 Problem</div><div class='v'>{probs}</div></div>",
             f"<div class='f'><div class='k'>📍 Location</div><div class='v{'' if sl.get('location') else ' muted'}'>{sl.get('location') or 'not yet'}</div></div>",
             f"<div class='f'><div class='k'>👥 People</div><div class='v{'' if sl.get('people') else ' muted'}'>{sl.get('people') or 'not stated'}</div></div>",
-            f"<div class='f'><div class='k'>🙋 Caller</div><div class='v{'' if sl.get('name') else ' muted'}'>{sl.get('name') or 'not given'}</div></div>",
+            f"<div class='f'><div class='k'>🙋 Caller</div><div class='v{'' if sl.get('name') else ' muted'}'>{sl.get('name') or 'not given'}"
+            + (f"<div style='font-weight:500;opacity:.8;font-size:.85rem'>📱 ••••••{sl['phone'][-4:]}</div>" if sl.get("phone") and sl["phone"] != "not given" else "")
+            + "</div></div>",
             f"<div class='f' style='grid-column:1/-1'><div class='k'>⚠️ Danger signs</div><div class='v'>{signs}</div></div>",
             (f"<div class='f' style='grid-column:1/-1'><div class='k'>📝 Description</div><div class='v'>{desc.strip()}</div></div>" if desc.strip() else ""),
             "</div>",
@@ -1314,13 +1492,13 @@ def incident_card_html(c_: dict) -> str:
         if a_.get("unit"):
             left = unit_left(a_, now)
             frac = 1 - left / a_["eta"] if a_["eta"] else 1
-            stage = 2 if left <= 0 else 1 if frac > 0.03 else 0
-            eta = "✅ on scene" if left <= 0 else f"{max(1, math.ceil(left))} min"
+            stage = 3 if a_.get("contact") else 2 if left <= 0 else 1 if frac > 0.03 else 0
+            eta = "🤝 with caller" if a_.get("contact") else "✅ on scene" if left <= 0 else f"{max(1, math.ceil(left))} min"
             html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b>{' <span class=chip>lead</span>' if a_.get('role') == 'lead' else ''}"
                         f" <span style='opacity:.7'>{a_['unit']}</span><span class='eta'>{eta}</span></div>"
                         f"<div class='bar' style='margin-top:6px'><i style='width:{100 * min(1, frac):.0f}%;background:{'#3BB57E' if left <= 0 else '#1C5D99'}'></i></div>"
                         "<div class='steps'>" + "".join(f"<span class='{'on' if k <= stage else ''}'>{n}</span>"
-                                                       for k, n in enumerate(["Dispatched", "On the way", "On scene"])) + "</div></div>")
+                                                       for k, n in enumerate(["Dispatched", "On the way", "On scene", "With caller"])) + "</div></div>")
         else:
             html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b> <span style='opacity:.7'>{a_.get('ticket') or ''}</span>"
                         f"<span class='eta' style='font-weight:600;opacity:.8'>{a_['status']}</span></div></div>")
@@ -1337,7 +1515,8 @@ def incident_card_html(c_: dict) -> str:
 def call_transcript(call: dict) -> str:
     lines = [f"Emergency call {call['ref']} ({time.strftime('%Y-%m-%d', time.localtime(call['started']))})"]
     for t_ in call["turns"]:
-        lines.append(f"[{t_['t']}] {'Call-taker' if t_['role'] == 'agent' else 'Caller'}: {t_['text']}")
+        who = {"agent": "Call-taker", "caller": "Caller"}.get(t_["role"], t_.get("who", "Crew"))
+        lines.append(f"[{t_['t']}] {who}: {t_['text']}")
     sl = call["slots"]
     lines += ["", "Summary:", f"  Problem: {', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or 'unclear'}",
               f"  Location: {sl.get('location') or 'unknown'}", f"  Severity: {call['severity']} of 5", f"  People: {sl.get('people') or 'not stated'}",
@@ -1974,7 +2153,30 @@ with tab_call:
         "<div style='opacity:.9'>Talk to the call-taker as you would on the phone. It asks what happened and where, sends the right teams "
         "as soon as it knows, keeps asking the important questions, and tells you what to do while help comes.</div></div>",
         unsafe_allow_html=True)
-    st.caption("Training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
+    sc1, sc2 = st.columns([4, 1])
+    sc1.caption("Training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
+    with sc2.popover("⚙️ Call settings"):
+        cur = cfg()
+        st.markdown("**Caller details**")
+        name_opts = {"early": "Early: right after help is sent", "end": "At the end, after the safety questions", "off": "Don't ask"}
+        n_ = st.radio("Ask the caller's name", list(name_opts), format_func=name_opts.get, index=list(name_opts).index(cur["name_when"]))
+        p_ = st.toggle("Ask for a call-back number", value=cur["ask_phone"])
+        st.markdown("**When the teams arrive**")
+        arr_opts = {"crew": "The crew joins the call and finds the caller (recommended)",
+                    "confirm": "Ask “can you see them?”, then hand over", "stay": "Stay on the line until the caller ends the call",
+                    "auto": "Hand over automatically"}
+        if cur["arrival"] not in arr_opts:
+            cur["arrival"] = "crew"
+        a_ = st.radio("Hand-over", list(arr_opts), format_func=arr_opts.get, index=list(arr_opts).index(cur["arrival"]))
+        an_ = st.toggle("Announce each arrival in the call", value=cur["announce"])
+        w_ = st.slider("Check on a silent caller after (seconds)", 15, 120, int(cur["wait"]), step=15,
+                       help="The call-taker asks “are you still on the line?”. It never hangs up on a caller, "
+                            "except with “Hand over automatically”.")
+        st.markdown("**Simulation**")
+        sp_ = st.slider("Travel speed: real seconds per simulated minute", 1.0, 10.0, float(cur["speed"]), step=0.5,
+                        help="Higher = vehicles take longer, so there is more time to talk.")
+        st.session_state.call_cfg = {"name_when": n_, "ask_phone": p_, "arrival": a_, "announce": an_, "wait": w_, "speed": sp_}
+        st.caption("Changes apply straight away; travel speed applies to vehicles sent after the change.")
     call = st.session_state.get("call")
     if call is None or call.get("ended") and st.session_state.get("call_closed_seen"):
         c1, c2, c3 = st.columns([1.2, 1.2, 2])
@@ -1997,6 +2199,10 @@ with tab_call:
             box = st.container(height=430, border=True)
             with box:
                 for t_ in call["turns"]:
+                    if t_["role"] == "crew":
+                        with st.chat_message("assistant", avatar=t_["who"].split()[0]):
+                            st.markdown(f"**{t_['who'].split(' ', 1)[-1]}**  \n{t_['text']}")
+                        continue
                     with st.chat_message("assistant" if t_["role"] == "agent" else "user",
                                          avatar="🧑‍💼" if t_["role"] == "agent" else "🙋"):
                         st.markdown(t_["text"])
@@ -2005,7 +2211,7 @@ with tab_call:
             lang = "hi-IN" if call["hindi"] else "en-IN"
             answer = None
             if not call["ended"]:
-                last_agent = next((t_ for t_ in reversed(call["turns"]) if t_["role"] == "agent"), None)
+                last_agent = next((t_ for t_ in reversed(call["turns"]) if t_["role"] != "caller"), None)
                 if VOICE_TYPING is not None:
                     res = VOICE_TYPING(key=f"call_live_{lang}",
                                        data={"lang": lang, "say": last_agent["text"] if last_agent else "",
