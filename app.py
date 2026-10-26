@@ -24,6 +24,42 @@ except ImportError:
     Groq = None
 
 import uuid
+from datetime import datetime, timedelta, timezone
+
+# ----------------------- Indian Standard Time -----------------------
+# Cloud servers (Streamlit Cloud included) run on UTC, so every time in the app is converted to IST explicitly.
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:                       # no time-zone database (e.g. some Windows setups without tzdata)
+    IST = timezone(timedelta(hours=5, minutes=30), "IST")
+
+
+def ist(ts: float | None = None) -> datetime:
+    """A Unix timestamp (or now) as an IST datetime."""
+    return datetime.fromtimestamp(time.time() if ts is None else ts, tz=IST)
+
+
+def ist_time(ts: float | None = None) -> str:
+    """24-hour clock, as used in Indian control-room logs: 14:06:07."""
+    return ist(ts).strftime("%H:%M:%S")
+
+
+def ist_date(ts: float | None = None) -> str:
+    """Indian date order, day first: 26-10-2026."""
+    return ist(ts).strftime("%d-%m-%Y")
+
+
+def ist_stamp(ts: float | None = None) -> str:
+    """Full stamp for records: 26-10-2026 14:06:07 IST."""
+    return ist(ts).strftime("%d-%m-%Y %H:%M:%S") + " IST"
+
+
+def ist_human(ts: float | None = None) -> str:
+    """Friendly form for people: Mon, 26 Oct 2026, 2:06 PM IST."""
+    d = ist(ts)
+    return d.strftime("%a, %d %b %Y, ") + d.strftime("%I:%M %p").lstrip("0") + " IST"
+
 
 try:                                    # observability: traces, feedback and evaluations in LangSmith
     import langsmith
@@ -56,7 +92,8 @@ st.set_page_config(
 
 st.title("🚨 Smart City Dynamic Dispatch Grid")
 
-st.caption("Synthetic emergency-call triage, incident prioritization, and vehicle dispatch demo")
+st.caption("Synthetic emergency-call triage, incident prioritization, and vehicle dispatch demo · "
+           f"🇮🇳 all times in IST (UTC+05:30) · {ist_human()}")
 st.warning(
     "Prototype only: this uses synthetic data and a simplified grid. "
     "Do not use it to make real emergency-response decisions."
@@ -573,7 +610,7 @@ def find_duplicate(rec: dict, calls: list[dict]) -> tuple[str | None, float]:
 
 def add_call(text: str, triage: dict, source: str, engine: str | None = None, audio: bytes | None = None) -> dict:
     rec = {"Call ID": f"CALL-{len(st.session_state.calls) + 1:03d}", "Call text": text.strip(), "Source": source,
-           "Voice engine": engine, "Recording": audio, "Triaged at": time.strftime("%H:%M:%S"), **triage}
+           "Voice engine": engine, "Recording": audio, "Triaged at": ist_time(), **triage}
     dup, score = find_duplicate(rec, st.session_state.calls)
     if dup:
         rec["duplicate_of"], rec["duplicate_score"] = dup, score
@@ -586,18 +623,18 @@ def add_call(text: str, triage: dict, source: str, engine: str | None = None, au
 
 
 # ----------------------- Multi-agent routing: the right problem goes to the right team -----------------------
-# Like 112 in India or 911 in the USA: one number, one call-taker, then the call is routed to every department that
+# Like ERSS-112 in India: one number, one call-taker, then the call is routed to every department that
 # has to act. Each step is a small "agent" with one job and a CONSTRAINED output: it can only choose from fixed lists,
 # so it can never invent a department, a severity or a place.
 DEPARTMENTS = {   # name -> icon, Indian helpline, vehicle type it sends (None = a ticket and a call-back), US equivalent
-    "Police":            {"icon": "🚓", "line": "100",  "fleet": "Police Car",  "code": "POL", "us": "Police (911)"},
-    "Fire & Rescue":     {"icon": "🚒", "line": "101",  "fleet": "Fire Truck",  "code": "FIR", "us": "Fire Department (911)"},
-    "Ambulance (EMS)":   {"icon": "🚑", "line": "108",  "fleet": "Ambulance",   "code": "EMS", "us": "EMS / ambulance (911)"},
-    "Disaster Response": {"icon": "🛟", "line": "1078", "fleet": "Rescue Team", "code": "DRF", "us": "Urban Search & Rescue / FEMA"},
-    "Gas Emergency":     {"icon": "🛢️", "line": "1906", "fleet": None,          "code": "GAS", "us": "Gas utility emergency line"},
-    "Electricity Board": {"icon": "⚡", "line": "1912", "fleet": None,          "code": "ELE", "us": "Power company outage line"},
-    "Women Helpline":    {"icon": "👩", "line": "1091", "fleet": None,          "code": "WOM", "us": "Domestic violence hotline"},
-    "Child Helpline":    {"icon": "🧒", "line": "1098", "fleet": None,          "code": "CHD", "us": "Child protective services"},
+    "Police":            {"icon": "🚓", "line": "100",  "fleet": "Police Car",  "code": "POL", "agency": "Police ERV (PCR van)", "lines": "112 / 100"},
+    "Fire & Rescue":     {"icon": "🚒", "line": "101",  "fleet": "Fire Truck",  "code": "FIR", "agency": "Fire control room", "lines": "101"},
+    "Ambulance (EMS)":   {"icon": "🚑", "line": "108",  "fleet": "Ambulance",   "code": "EMS", "agency": "108 ambulance service", "lines": "108 / 102"},
+    "Disaster Response": {"icon": "🛟", "line": "1078", "fleet": "Rescue Team", "code": "DRF", "agency": "SDRF / NDRF", "lines": "1078"},
+    "Gas Emergency":     {"icon": "🛢️", "line": "1906", "fleet": None,          "code": "GAS", "agency": "Gas distribution company", "lines": "1906"},
+    "Electricity Board": {"icon": "⚡", "line": "1912", "fleet": None,          "code": "ELE", "agency": "Electricity board (DISCOM)", "lines": "1912"},
+    "Women Helpline":    {"icon": "👩", "line": "1091", "fleet": None,          "code": "WOM", "agency": "Women helpline", "lines": "181 / 1091"},
+    "Child Helpline":    {"icon": "🧒", "line": "1098", "fleet": None,          "code": "CHD", "agency": "Childline", "lines": "1098"},
 }
 PROBLEMS = {      # the ONLY problem categories the router may choose; each one says which teams must act
     "fire":          {"label": "Fire", "kw": ["fire", "smoke", "flames", "burning", "blaze", "aag", "dhuan"], "teams": ["Fire & Rescue"]},
@@ -762,7 +799,7 @@ def dispatch_departments(teams: list[dict], location: str | None, ref: str) -> l
             st.session_state.ticket_no = st.session_state.get("ticket_no", 0) + 1
             a.update(ticket=f"{info['code']}-{st.session_state.ticket_no:03d}", eta=CALLBACK_MIN.get(tm["dept"], 10),
                      status=f"notified, call-back within {CALLBACK_MIN.get(tm['dept'], 10)} min")
-        a["ref"], a["created"] = ref, time.strftime("%H:%M:%S")
+        a["ref"], a["created"] = ref, ist_time()
         out.append(a)
     return out
 
@@ -779,9 +816,9 @@ def run_agents(text: str, triage: dict, ref: str, source: str, voice: dict | Non
         steps.append({"icon": icon, "agent": agent, "did": did, "ms": round(ms, 1)})
     t0 = time.perf_counter()
     if voice and voice.get("text"):
-        step("🎙️", "Intake agent", f"Voice recorded ({voice.get('duration') or 0:.1f} s) and written by {voice.get('engine')}: “{text[:120]}”", 0)
+        step("🎙️", "Communication Officer agent (intake)", f"Voice recorded ({voice.get('duration') or 0:.1f} s) and written by {voice.get('engine')}: “{text[:120]}”", 0)
     else:
-        step("⌨️", "Intake agent", f"{source} report received: “{text[:120]}”", 0)
+        step("🎧", "Communication Officer agent (intake)", f"{source} report received: “{text[:120]}”", 0)
     step("🧭", "Triage agent (constrained)",
          f"{triage.get('incident_type')}, severity {triage.get('severity')} of 5, location {triage.get('location') or 'unknown'}, "
          f"people {triage.get('people') or 'not stated'}. Decided by {triage.get('triage_method', 'rules')}. "
@@ -806,7 +843,7 @@ def run_agents(text: str, triage: dict, ref: str, source: str, voice: dict | Non
     step("🧑‍💼", "Supervisor (human in the loop)",
          ("Check needed: " + "; ".join(route["review"])) if route["review"] else "No check needed: every team has its job.", 0)
     run = {"ref": ref, "text": text, "route": route, "assignments": assignments, "steps": steps,
-           "total_ms": round((time.perf_counter() - t0) * 1000, 1), "time": time.strftime("%H:%M:%S")}
+           "total_ms": round((time.perf_counter() - t0) * 1000, 1), "time": ist_time()}
     st.session_state.setdefault("agent_runs", []).append(run)
     return run
 
@@ -843,7 +880,7 @@ digraph G {
 
 
 # ----------------------- Emergency call: a spoken conversation with a call-taker agent -----------------------
-# Like a 112 / 911 call-taker: ask what happened and where, send help as soon as both are known, keep asking the
+# Like an ERSS-112 call-taker: ask what happened and where, send help as soon as both are known, keep asking the
 # questions of that problem's protocol (breathing? trapped? weapon?), raise urgency when the answers demand it,
 # alert extra departments when new problems appear, and give life-saving instructions while help is on the way.
 CALL_Q = {   # slot -> (English, Hindi)
@@ -953,13 +990,13 @@ def add_event(call: dict, icon: str, text: str) -> None:
 
 
 def agent_say(call: dict, text: str) -> None:
-    call["turns"].append({"role": "agent", "text": text, "t": time.strftime("%H:%M:%S")})
+    call["turns"].append({"role": "agent", "text": text, "t": ist_time()})
     call["last_prompt_at"] = time.time()
 
 
 def crew_say(call: dict, a_: dict, text: str) -> None:
     """A crew member speaks in the call (three-way call: caller, call-taker, crew)."""
-    call["turns"].append({"role": "crew", "who": f"{a_['icon']} {a_['unit']} crew", "text": text, "t": time.strftime("%H:%M:%S")})
+    call["turns"].append({"role": "crew", "who": f"{a_['icon']} {a_['unit']} crew", "text": text, "t": ist_time()})
     call["last_prompt_at"] = time.time()
 
 
@@ -1140,7 +1177,7 @@ CALL_DEFAULTS = {
 DIAL_SERVICES = {   # number -> (service, problem hint used only if the call stays unclear)
     "112": ("Emergency 112", None), "100": ("Police 100", "crime"), "101": ("Fire 101", "fire"), "102": ("Ambulance 102", "medical"),
     "108": ("Ambulance 108", "medical"), "1078": ("Disaster 1078", "flood"), "1091": ("Women helpline 1091", "women_safety"),
-    "181": ("Women helpline 181", "women_safety"), "1098": ("Child helpline 1098", "child"), "911": ("911 → 112", None),
+    "181": ("Women helpline 181", "women_safety"), "1098": ("Child helpline 1098", "child"),
 }
 DIAL_GREETING = ("{svc}. You are connected to the 112 emergency response centre. What is the location of your emergency? "
                  "Then tell me exactly what happened.",
@@ -1565,7 +1602,7 @@ def hand_over(call: dict, why: str = "Caller confirmed the crew is with them: ca
 def caller_says(call: dict, text: str) -> dict:
     """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
     hindi = call["hindi"]
-    call["turns"].append({"role": "caller", "text": text.strip(), "t": time.strftime("%H:%M:%S")})
+    call["turns"].append({"role": "caller", "text": text.strip(), "t": ist_time()})
     call["last_caller_at"] = time.time()
     call["still_checks"], call["kept_open"] = 0, False          # the caller spoke: they are on the line
     if call.get("pending") == "crew_locate":
@@ -1663,7 +1700,8 @@ def caller_says(call: dict, text: str) -> dict:
                           hint=(sl.get("problems") or [call.get("dial_hint")])[0], dispatch=False)
         parts += cad_dispatch(call, hindi)
         call["dispatched"] = True
-        run_["assignments"] = call["assignments"]
+        run_["assignments"] = call["assignments"]          # same list: later units appear in the trace too
+        run_["call"] = call
         rec["assignments"], rec["teams"] = call["assignments"], [a_["dept"] for a_ in call["assignments"]]
         first_unit = next((a_ for a_ in sorted(call["assignments"], key=lambda a_: a_.get("eta") or 1e9) if a_.get("unit")), None)
         if first_unit:
@@ -1805,7 +1843,7 @@ def incident_card_html(c_: dict) -> str:
         f"<span class='fv'>{f_['value'] or ('asking now…' if f_['asking'] else 'not yet')}</span>"
         f"<span class='fs'>{f_['src'] if f_['value'] else ''}</span></div>" for f_ in facts)
     sysbox = (f"<div class='sys'><span>📟 <b>System</b></span><span>Caller ID (ANI): {c_.get('ani', 'withheld')}</span>"
-              f"<span>Received: {time.strftime('%H:%M:%S', time.localtime(c_['started']))}</span>"
+              f"<span>Received: {ist_stamp(c_['started'])}</span>"
               f"<span>Dialled: {c_.get('dialed', '112')}</span><span>Line: mobile</span>"
               f"<span>Language: {'Hindi' if c_.get('hindi') else 'English'}</span>"
               f"<span>Location (ALI): {'from caller' if sl.get('location') else 'not available: ask the caller'}</span></div>")
@@ -1863,7 +1901,7 @@ def incident_card_html(c_: dict) -> str:
                        if a_.get("unit") else "")) if a_ else "pending"
             rows.append(f"<li><span>{DEPARTMENTS[cd['dept']]['icon']}</span><span><b>{cd['dept']}</b> · {cd['why']}</span>"
                         f"<span style='opacity:.75'>{what}</span></li>")
-        radio_rows = "".join(f"<li><time>{time.strftime('%H:%M:%S', time.localtime(t_))}</time><span>{ic}</span><span>{tx}</span></li>"
+        radio_rows = "".join(f"<li><time>{ist_time(t_)}</time><span>{ic}</span><span>{tx}</span></li>"
                              for t_, ic, tx in c_.get("radio", [])[-6:])
         etype = ", ".join(PROBLEMS[p]["label"] for p in c_["slots"].get("problems", [])) or "Unclear (police check)"
         agencies = " · ".join(dict.fromkeys(AGENCY.get(a_["dept"], a_["dept"]) for a_ in c_["assignments"]))
@@ -1880,13 +1918,13 @@ def incident_card_html(c_: dict) -> str:
     ev = c_.get("events", [])
     if ev:
         html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🕒</span><b>Timeline</b></div><ul class='tl'>"
-                    + "".join(f"<li><time>{time.strftime('%H:%M:%S', time.localtime(t_))}</time><span>{ic}</span><span>{tx}</span></li>"
+                    + "".join(f"<li><time>{ist_time(t_)}</time><span>{ic}</span><span>{tx}</span></li>"
                               for ic, tx, t_ in ev[-9:]) + "</ul></div>")
     return "".join(html)
 
 
 def call_transcript(call: dict) -> str:
-    lines = [f"Emergency call {call['ref']} ({time.strftime('%Y-%m-%d', time.localtime(call['started']))})"]
+    lines = [f"Emergency call {call['ref']}", f"Received: {ist_stamp(call['started'])} (Indian Standard Time, UTC+05:30)"]
     for t_ in call["turns"]:
         who = {"agent": "Call-taker", "caller": "Caller"}.get(t_["role"], t_.get("who", "Crew"))
         lines.append(f"[{t_['t']}] {who}: {t_['text']}")
@@ -1894,7 +1932,7 @@ def call_transcript(call: dict) -> str:
     lines += ["", "Summary:", f"  Problem: {', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or 'unclear'}",
               f"  Location: {sl.get('location') or 'unknown'}", f"  Severity: {call['severity']} of 5", f"  People: {sl.get('people') or 'not stated'}",
               "  Teams: " + (", ".join(f"{a_['dept']} ({a_.get('unit') or a_.get('ticket') or a_.get('status')})" for a_ in call["assignments"]) or "none"),
-              "", "Timeline:"] + [f"  {time.strftime('%H:%M:%S', time.localtime(t_))} {ic} {tx}" for ic, tx, t_ in call.get("events", [])]
+              "", "Timeline:"] + [f"  {ist_time(t_)} {ic} {tx}" for ic, tx, t_ in call.get("events", [])]
     return "\n".join(lines)
 
 
@@ -2404,7 +2442,7 @@ def ls_extra(tag: str, thread: str) -> dict:
 def send_feedback(run_id: str | None, scores: dict, comment: str = "", correction: dict | None = None) -> str:
     """Store feedback locally (for the accuracy page) and in LangSmith on the run it judges."""
     st.session_state.setdefault("feedback_log", []).append({"run_id": run_id, **scores, "comment": comment,
-                                                            "correction": correction, "time": time.strftime("%H:%M:%S")})
+                                                            "correction": correction, "time": ist_time()})
     if ls_client is None or not run_id:
         return "saved in this session (LangSmith is not connected)"
     try:
@@ -2583,7 +2621,8 @@ with tab_call:
         check_arrivals(call)
         if not call["ended"]:
             bar1, bar2, bar3, bar4 = st.columns([3.2, 1.1, 1.1, 1.1])
-            bar1.markdown(f"<div class='callbar'><span class='dot'></span><div><b>Connected · {call.get('dialed', '112')}</b><br>"
+            bar1.markdown(f"<div class='callbar'><span class='dot'></span><div><b>Connected · {call.get('dialed', '112')} · "
+                          f"since {ist_time(call['started'])} IST</b><br>"
                           f"<span>112 Emergency Response Centre · Caller ID (ANI) {call.get('ani', 'withheld')}</span></div></div>",
                           unsafe_allow_html=True)
             bar2.toggle("🎤 Auto-listen", value=True, key="call_hands", help="After each question, the microphone listens by itself.")
@@ -2693,60 +2732,159 @@ with tab_call:
                 st.markdown(incident_card_html(c_), unsafe_allow_html=True)
             call_panel()
 
+DEPT_CSS = """
+<style>
+.dh{border-radius:16px;margin-bottom:14px;background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.25);
+  border-top:5px solid #FF9933;border-bottom:5px solid #138808}
+.dh>div{padding:14px 20px}
+.dh b{font-size:1.45rem}.dh p{margin:4px 0 0;opacity:.8}
+.dflow{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:10px;margin:6px 0 4px}
+@media (max-width:1100px){.dflow{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.dfs{position:relative;border:1px solid rgba(128,128,128,.3);border-radius:14px;padding:12px;background:rgba(128,128,128,.06)}
+.dfs .i{font-size:1.5rem}.dfs b{display:block;margin:4px 0 2px;font-size:.95rem}.dfs p{margin:0;font-size:.78rem;opacity:.78;line-height:1.35}
+.dfs .tag{display:inline-block;margin-top:6px;font-size:.68rem;font-weight:700;border-radius:999px;padding:2px 8px;background:rgba(28,93,153,.18);color:#5aa2e8}
+.dfs.cit{border-color:#D62839;background:rgba(214,40,57,.08)}.dfs.end{border-color:#1F8A5B;background:rgba(31,138,91,.08)}
+.dfs.cad{border-color:#E46A1E;background:rgba(228,106,30,.08)}
+.sup2{border:1px dashed #C98A0C;border-radius:12px;padding:8px 12px;font-size:.84rem;background:rgba(201,138,12,.08);margin:6px 0 18px}
+.trace{position:relative;margin-left:8px;padding-left:22px;border-left:2px solid rgba(128,128,128,.25)}
+.ts{position:relative;margin:0 0 10px;border:1px solid rgba(128,128,128,.22);border-radius:12px;padding:10px 12px;background:rgba(128,128,128,.04)}
+.ts:before{content:"";position:absolute;left:-30px;top:14px;width:12px;height:12px;border-radius:50%;background:#1C5D99;border:2px solid #0e141a}
+.ts.tcad:before{background:#E46A1E}.ts.dept:before{background:#1F8A5B}.ts.sup:before{background:#C98A0C}
+.ts .h{display:flex;gap:8px;align-items:center}.ts .h b{font-size:.95rem}.ts .h span.ms{margin-left:auto;font-size:.72rem;opacity:.55}
+.ts .d{font-size:.86rem;opacity:.88;margin-top:3px}
+.chips2 span{display:inline-block;border-radius:999px;padding:3px 10px;margin:0 6px 6px 0;font-size:.8rem;font-weight:650;background:rgba(128,128,128,.14)}
+.boards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+@media (max-width:1100px){.boards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.bd{border:1px solid rgba(128,128,128,.28);border-radius:14px;padding:12px 14px;background:rgba(128,128,128,.04)}
+.bd .t{display:flex;align-items:center;gap:8px}.bd .t b{font-size:1rem}.bd .t .n{margin-left:auto;font-size:1.5rem;font-weight:800}
+.bd .s{font-size:.76rem;opacity:.65;margin:2px 0 8px}
+.bd .st{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}.bd .st span{font-size:.7rem;border-radius:999px;padding:2px 8px;background:rgba(128,128,128,.14)}
+.bd .j{font-size:.8rem;border-top:1px solid rgba(128,128,128,.16);padding:5px 0}
+.bd .j em{font-style:normal;font-size:.7rem;border-radius:6px;padding:1px 6px;margin-left:4px;background:rgba(28,93,153,.2)}
+.bd .j em.ok{background:rgba(31,138,91,.22)}.bd .j em.cl{background:rgba(128,128,128,.22)}
+.bd .none{font-size:.8rem;opacity:.5}
+</style>
+"""
+
+
+def unit_status(a_: dict) -> tuple[str, str]:
+    """A unit's ERSS-style status and a css class."""
+    if a_.get("released"):
+        return "released", "cl"
+    if a_.get("atr"):
+        return "ATR closed", "cl"
+    if a_.get("at_hospital"):
+        return "at hospital", "ok"
+    if a_.get("transport_at"):
+        return "transporting", "ok"
+    if a_.get("contact"):
+        return "with caller", "ok"
+    if a_.get("arrived"):
+        return "reached", "ok"
+    if a_.get("unit"):
+        return "en route", ""
+    return a_.get("status", "ticket"), ""
+
+
 with tab_dept:
-    st.subheader("How a call reaches the right team")
-    st.caption("Like 112 in India or 911 in the USA: one number, then each agent does one job and passes the call on. "
-               "The triage and router agents are constrained: they can only choose from fixed lists, so they never invent "
-               "a department, a severity or a place. Anything unclear goes to a human supervisor.")
-    st.graphviz_chart(AGENT_DIAGRAM)
+    st.markdown(DEPT_CSS, unsafe_allow_html=True)
+    st.markdown("<div class='dh'><div><b>🇮🇳 ERSS-112: how a call reaches the right team</b>"
+                "<p>One number for every emergency. Each agent does one job and passes the call on. The triage and router agents are "
+                "constrained to fixed lists, the CAD sets the priority and the units, and anything unclear goes to a human supervisor.</p></div></div>",
+                unsafe_allow_html=True)
+    steps_html = [("cit", "📞", "Citizen", "Dials 112 and speaks in English or Hindi.", "112"),
+                  ("", "🎧", "Communication Officer agent", "Answers, records the voice, writes it as text; caller number from the system.", "intake"),
+                  ("", "🧭", "Triage agent", "Type, severity 1-5, location, people. Fixed answers only.", "constrained"),
+                  ("", "🔀", "Router agent", "Finds every problem and the departments that must act.", "constrained"),
+                  ("cad", "🧠", "CAD", "Priority P1-P4 and the run card: which units, and why.", "ERSS-112"),
+                  ("", "🗺️", "Dispatch Officer", "Nearest ERV by GPS; conferences 101, 108 and helplines.", "dispatch"),
+                  ("end", "📍", "Tracking & ATR", "Live status in the call, hand-over, Action Taken Report.", "citizen sees it")]
+    st.markdown("<div class='dflow'>" + "".join(
+        f"<div class='dfs {c}'><div class='i'>{i}</div><b>{t}</b><p>{d}</p><span class='tag'>{g}</span></div>" for c, i, t, d, g in steps_html)
+        + "</div><div class='sup2'>🧑‍💼 <b>Supervisor (human in the loop)</b> checks any call the agents are unsure about: unknown place, "
+          "unclear problem, low confidence. A call is never dismissed by an agent on its own.</div>", unsafe_allow_html=True)
 
-    runs = st.session_state.get("agent_runs", [])
-    st.markdown("#### Latest call, step by step")
-    if not runs:
-        st.info("Make an **Emergency call**. Every agent's decision appears here.")
-    else:
-        pick = st.selectbox("Show the agents' work for", [r_["ref"] for r_ in runs][::-1], key="agent_pick")
-        run_ = next(r_ for r_ in runs if r_["ref"] == pick)
-        for k_, stp in enumerate(run_["steps"], 1):
-            st.markdown(f"<div style='display:grid;grid-template-columns:34px 1fr auto;gap:10px;align-items:start;padding:8px 10px;"
-                        f"border:1px solid rgba(128,128,128,.25);border-radius:12px;margin-bottom:6px'>"
-                        f"<div style='font-size:1.4rem'>{stp['icon']}</div><div><b>{k_}. {stp['agent']}</b><br>"
-                        f"<span style='opacity:.85'>{stp['did']}</span></div><div style='opacity:.6;font-size:.8rem'>{stp['ms']} ms</div></div>",
-                        unsafe_allow_html=True)
-        st.caption(f"Whole pipeline: {run_['total_ms']} ms.")
+    @st.fragment(run_every=2.0)
+    def dept_live() -> None:
+        """Trace and boards refresh every 2 seconds, so unit status stays in step with the call."""
+        runs = st.session_state.get("agent_runs", [])
+        st.markdown("#### 🔎 Latest call, step by step")
+        if not runs:
+            st.info("Make an **Emergency call**. Every agent's decision appears here, live.")
+        else:
+            pick = st.selectbox("Call for Service", [r_["ref"] for r_ in runs][::-1], key="agent_pick", label_visibility="collapsed")
+            run_ = next(r_ for r_ in runs if r_["ref"] == pick)
+            call_ = run_.get("call")
+            base = [stp for stp in run_["steps"] if not stp["agent"].startswith("Supervisor")]
+            sup = next((stp for stp in run_["steps"] if stp["agent"].startswith("Supervisor")), None)
+            html_ = []
+            for stp in base:
+                html_.append(f"<div class='ts'><div class='h'><span>{stp['icon']}</span><b>{stp['agent']}</b><span class='ms'>{stp['ms']} ms</span></div>"
+                             f"<div class='d'>{stp['did']}</div></div>")
+            if call_ and call_.get("level"):
+                lv = LEVELS[call_["level"]]
+                card = "".join(f"<li>{DEPARTMENTS[cd['dept']]['icon']} <b>{cd['dept']}</b>: {cd['why']}</li>" for cd in call_.get("run_card", []))
+                html_.append(f"<div class='ts tcad'><div class='h'><span>🧠</span><b>CAD decision (ERSS-112)</b></div>"
+                             f"<div class='d'>Priority <b style='color:{lv[3]}'>{lv[0]}</b>: {lv[1]}. Run card:<ul style='margin:4px 0 0 18px'>{card}</ul></div></div>")
+            for a_ in (call_["assignments"] if call_ else run_.get("assignments", [])):
+                stt, _cls = unit_status(a_)
+                who = AGENCY.get(a_["dept"], a_["dept"])
+                what = (f"{a_['unit']} sent ({a_.get('why', '')}), about {a_['eta']:.0f} min" if a_.get("unit")
+                        else f"Ticket {a_.get('ticket') or ''}: {a_.get('status', '')}")
+                html_.append(f"<div class='ts dept'><div class='h'><span>{a_['icon']}</span><b>{a_['dept']} · {who}</b>"
+                             f"<span class='ms'>{stt}</span></div><div class='d'>{what}</div></div>")
+            if sup:
+                html_.append(f"<div class='ts sup'><div class='h'><span>🧑‍💼</span><b>Supervisor</b></div><div class='d'>{sup['did']}</div></div>")
+            chips_ = [f"CFS {run_['ref']}"]
+            if call_ and call_.get("level"):
+                chips_.append(LEVELS[call_["level"]][0])
+                chips_ += list(dict.fromkeys(AGENCY.get(a_["dept"], a_["dept"]) for a_ in call_["assignments"]))
+            st.markdown("<div class='chips2'>" + "".join(f"<span>{c}</span>" for c in chips_) + "</div>"
+                        "<div class='trace'>" + "".join(html_) + "</div>", unsafe_allow_html=True)
+            st.caption(f"Agents' processing time: {run_['total_ms']} ms.")
 
-    st.markdown("#### Department boards")
-    jobs = st.session_state.get("dept_jobs", [])
-    names = list(DEPARTMENTS)
-    for row_ in (names[:4], names[4:]):
-        cols = st.columns(4)
-        for col, d in zip(cols, row_):
-            info = DEPARTMENTS[d]
-            mine = [j for j in jobs if j["dept"] == d]
-            with col.container(border=True):
-                st.markdown(f"**{info['icon']} {d}**  \n<span style='opacity:.7;font-size:.85rem'>Helpline {info['line']} · "
-                            f"USA: {info['us']}</span>", unsafe_allow_html=True)
-                st.metric("Jobs", len(mine), label_visibility="collapsed")
-                for j in mine[::-1][:4]:
-                    what = j.get("unit") or j.get("ticket") or "waiting"
-                    st.markdown(f"<div style='font-size:.85rem;border-top:1px solid rgba(128,128,128,.2);padding-top:4px'>"
-                                f"<b>{j['ref']}</b> {j['problem']}<br>{j.get('location') or 'location unknown'} · {what} · "
-                                f"<span style='opacity:.7'>{j['status']}</span></div>", unsafe_allow_html=True)
-                if not mine:
-                    st.caption("No jobs yet.")
+        st.markdown("#### 🏢 Department boards")
+        jobs_by = {}
+        for r_ in st.session_state.get("agent_runs", []):
+            c_ = r_.get("call")
+            for a_ in (c_["assignments"] if c_ else r_.get("assignments", [])):
+                jobs_by.setdefault(a_["dept"], []).append((r_["ref"], c_, a_))
+        cards = []
+        for d, info in DEPARTMENTS.items():
+            jobs = jobs_by.get(d, [])
+            counts = {"en route": 0, "on scene": 0, "closed": 0}
+            rows = []
+            for ref, c_, a_ in reversed(jobs):
+                stt, cls = unit_status(a_)
+                counts["closed" if cls == "cl" else "on scene" if cls == "ok" else "en route"] += 1
+                place = (c_ or {}).get("slots", {}).get("location") or "location pending"
+                prob = ", ".join(PROBLEMS[p]["label"] for p in (c_ or {}).get("slots", {}).get("problems", [])) or "—"
+                rows.append(f"<div class='j'><b>{ref}</b> {prob}<br>{place} · {a_.get('unit') or a_.get('ticket') or ''}<em class='{cls}'>{stt}</em></div>")
+            cards.append(f"<div class='bd'><div class='t'><span style='font-size:1.3rem'>{info['icon']}</span><b>{d}</b><span class='n'>{len(jobs)}</span></div>"
+                         f"<div class='s'>{info['agency']} · ☎ {info['lines']}</div>"
+                         + (f"<div class='st'><span>🚦 en route {counts['en route']}</span><span>📍 on scene {counts['on scene']}</span>"
+                            f"<span>✔ closed {counts['closed']}</span></div>" if jobs else "")
+                         + ("".join(rows[:4]) if rows else "<div class='none'>No jobs yet.</div>") + "</div>")
+        st.markdown("<div class='boards'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
 
-    with st.expander("🇮🇳 How ERSS-112 works (and how it compares with 🇺🇸 911)"):
+    dept_live()
+
+    with st.expander("🇮🇳 How ERSS-112 works, step by step"):
         st.markdown("""
-| Step | India (112 ERSS) | USA (911) | In this app |
-|---|---|---|---|
-| One emergency number | 112 (also 100, 101, 108) | 911 | Emergency Help page |
-| Call-taker answers | ERC call-taker | PSAP call-taker | 🎙️ Intake agent |
-| Questions: what, where, how bad | Structured questions | Protocols such as EMD | 🧭 Triage agent (constrained) |
-| Decide who must act | Dispatcher selects agencies | CAD system recommends units | 🔀 Router agent (constrained) |
-| Agencies send units | Police, fire, ambulance, NDRF | Police, fire, EMS | 🚓 🚒 🚑 🛟 department agents |
-| Specialist lines | 1091 women, 1098 child, 1906 gas, 1912 power | Hotlines, utilities, CPS | 👩 🧒 🛢️ ⚡ tickets and call-backs |
-| Supervisor checks unclear calls | Shift supervisor | Supervisor / QA | 🧑‍💼 human in the loop |
+| Step | In ERSS-112 | In this app |
+|---|---|---|
+| One number for every emergency | **112** (100, 101, 108, 1091, 1098 also reach help) | 📞 Emergency call tab |
+| Call answered at the state Emergency Response Centre (ERC) | Communication Officer; caller number and location from the network or the 112 India app | 🎧 Communication Officer agent, Caller ID (ANI) |
+| Event created | Call for Service (CFS) with event type and priority | 🧭 Triage agent + 🧠 CAD priority P1-P4 |
+| Decide who must act | Dispatch Officer picks the nearest police ERV by GPS and conferences the call to 101 fire, 108 ambulance or a helpline | 🔀 Router agent + CAD run card |
+| Units respond | Assigned → en route → reached, updates on the mobile data terminal | 🚓 🚒 🚑 🛟 department agents, live status in the call |
+| Specialist help | 181 / 1091 women, 1098 child, 1906 gas, 1912 electricity, SDRF / NDRF | 👩 🧒 🛢️ ⚡ tickets and call-backs |
+| Job closed | Action Taken Report (ATR) | 📝 ATR in the timeline |
+| Unclear calls | Supervisor at the ERC | 🧑‍💼 human in the loop |
 """)
+        st.caption("A simplified model for training: the priorities and run cards here are a design based on how ERSS-112 is described, "
+                   "not the official ERSS code lists.")
+
 
 with tab_acc:
     st.subheader("Accuracy & observability (LangSmith)")
