@@ -847,8 +847,8 @@ digraph G {
 # questions of that problem's protocol (breathing? trapped? weapon?), raise urgency when the answers demand it,
 # alert extra departments when new problems appear, and give life-saving instructions while help is on the way.
 CALL_Q = {   # slot -> (English, Hindi)
-    "problem": ("112, what is your emergency? Tell me what is happening.",
-                "112, आपकी आपात स्थिति क्या है? बताइए क्या हो रहा है।"),
+    "problem": ("112, what is the location of your emergency? Then tell me exactly what happened.",
+                "112, आपकी आपात स्थिति की जगह क्या है? फिर ठीक-ठीक बताइए क्या हुआ।"),
     "problem_again": ("I need to understand what happened. Is it a fire, an accident, someone ill or hurt, a crime, a building collapse, "
                       "a flood, a gas leak or a fallen electric wire?",
                       "मुझे समझना है क्या हुआ। आग, दुर्घटना, कोई बीमार या घायल, अपराध, इमारत गिरना, बाढ़, गैस लीक या बिजली का तार?"),
@@ -1084,9 +1084,53 @@ CALL_DEFAULTS = {
 }
 
 
+DIAL_SERVICES = {   # number -> (service, problem hint used only if the call stays unclear)
+    "112": ("Emergency 112", None), "100": ("Police 100", "crime"), "101": ("Fire 101", "fire"), "102": ("Ambulance 102", "medical"),
+    "108": ("Ambulance 108", "medical"), "1078": ("Disaster 1078", "flood"), "1091": ("Women helpline 1091", "women_safety"),
+    "181": ("Women helpline 181", "women_safety"), "1098": ("Child helpline 1098", "child"), "911": ("911 → 112", None),
+}
+DIAL_GREETING = ("{svc}. You are connected to the 112 emergency response centre. What is the location of your emergency? "
+                 "Then tell me exactly what happened.",
+                 "{svc}। आप 112 आपातकालीन सेवा से जुड़ गए हैं। आपात स्थिति की जगह क्या है? फिर ठीक-ठीक बताइए क्या हुआ।")
+DIALER_CSS = """
+<style>
+.st-key-phone{max-width:380px;margin:4px auto 0;background:linear-gradient(180deg,#18212b,#0e141a);border:1px solid rgba(128,128,128,.35);
+  border-radius:40px;padding:20px 24px 24px;box-shadow:0 18px 40px -18px rgba(0,0,0,.6)}
+.st-key-phone, .st-key-phone p, .st-key-phone label{color:#E6ECF2}
+[class*="st-key-dial_k_"] button{border-radius:999px !important;height:64px !important;font-size:1.55rem !important;font-weight:600 !important;
+  background:rgba(255,255,255,.08) !important;border:1px solid rgba(255,255,255,.12) !important;color:#fff !important}
+[class*="st-key-dial_k_"] button:hover{background:rgba(255,255,255,.16) !important}
+[class*="st-key-dial_k_"] button p{font-size:1.6rem !important;font-weight:500 !important}
+.st-key-dial_call button p{font-size:1.5rem !important}
+.st-key-dial_back button p, .st-key-dial_clear button p{font-size:1.35rem !important}
+.st-key-dial_call button{background:#1F9D5B !important;border-color:#1F9D5B !important;color:#fff !important;border-radius:999px !important;
+  height:64px !important;font-size:1.15rem !important;font-weight:700 !important}
+.st-key-dial_back button, .st-key-dial_clear button{border-radius:999px !important;height:64px !important;background:transparent !important;
+  border:0 !important;color:#cfd8e3 !important;font-size:1.2rem !important}
+.st-key-ring_cancel button, .st-key-end_call button{background:#D62839 !important;border-color:#D62839 !important;color:#fff !important;
+  border-radius:999px !important;font-weight:700 !important}
+.dial-screen{text-align:center;padding:6px 0 12px}
+.dial-screen .num{font-size:2.6rem;font-weight:300;letter-spacing:.12em;color:#fff;min-height:3.2rem;font-variant-numeric:tabular-nums}
+.dial-screen .svc{font-size:.9rem;color:#9fb0c2;min-height:1.3rem}
+.ring{display:grid;place-items:center;padding:26px 0 18px}
+.ring .bub{width:110px;height:110px;border-radius:50%;background:#1C5D99;display:grid;place-items:center;font-size:2.6rem;position:relative}
+.ring .bub:before,.ring .bub:after{content:"";position:absolute;inset:0;border-radius:50%;border:2px solid #4f8fd6;animation:rp 1.6s ease-out infinite}
+.ring .bub:after{animation-delay:.8s}
+@keyframes rp{from{transform:scale(1);opacity:.7}to{transform:scale(1.9);opacity:0}}
+.ring .t1{margin-top:22px;font-size:1.5rem;color:#fff;font-weight:600}.ring .t2{color:#9fb0c2}
+.callbar{display:flex;align-items:center;gap:12px;background:linear-gradient(90deg,#0f3d2a,#14532d);color:#fff;border-radius:16px;
+  padding:10px 16px;margin-bottom:8px}
+.callbar .dot{width:10px;height:10px;border-radius:50%;background:#4ade80;animation:cb 1.2s infinite}
+@keyframes cb{50%{opacity:.25}}
+.callbar b{font-size:1.05rem}.callbar span{opacity:.85;font-size:.9rem}
+@media (prefers-reduced-motion:reduce){.ring .bub:before,.ring .bub:after,.callbar .dot{animation:none}}
+</style>
+"""
+
+
 def cfg() -> dict:
     """The call settings chosen in "⚙️ Call settings" (defaults above)."""
-    return {**CALL_DEFAULTS, **st.session_state.get("call_cfg", {})}
+    return dict(CALL_DEFAULTS)                     # fixed, recommended behaviour (no settings panel)
 CALL_Q.update({
     "crew_locate": ("Please tell the crew exactly where you are: a gate, shop, floor, or what you are wearing.",
                     "कृपया टीम को ठीक-ठीक बताइए आप कहाँ हैं: गेट, दुकान, मंज़िल, या आपने क्या पहना है।"),
@@ -1170,6 +1214,169 @@ def eta_reply(call: dict) -> str:
     return " ".join(lines)
 
 
+# ======================= CAD backend: how a US 911 centre decides which units to send =======================
+# 1) The call-taker classifies the call and sets a RESPONSE LEVEL from the answers (like the Alpha-to-Echo levels used by US
+#    dispatch protocols). 2) A RUN CARD turns call type + level into a list of units (US practice: a fire engine co-responds to
+#    cardiac arrest, police control traffic at serious fires and crashes, a second engine for a working fire).
+# 3) The dispatcher sends each unit by RADIO. 4) Units report status: dispatched, en route, on scene, transporting, at hospital.
+LEVELS = {   # code -> name, meaning, response mode, colour
+    "E": ("ECHO", "Immediate threat to life", "Lights & sirens, closest units", "#7C3AED"),
+    "D": ("DELTA", "Life-threatening", "Lights & sirens", "#D62839"),
+    "C": ("CHARLIE", "Serious: advanced care may be needed", "Lights & sirens", "#E46A1E"),
+    "B": ("BRAVO", "Urgent, not life-threatening", "Urgent, no sirens", "#D9A21B"),
+    "A": ("ALPHA", "Non-urgent", "Normal traffic", "#86AE3A"),
+    "O": ("OMEGA", "No vehicle needed: helpline call-back", "Call-back", "#8A97A5"),
+}
+LEVEL_ORDER = "OABCDE"
+
+
+MIN_LEVEL = {"fire": "C", "collapse": "D", "road_accident": "C", "gas_leak": "C", "flood": "C", "women_safety": "C", "child": "C",
+             "crime": "B", "electric": "B", "medical": "A"}     # e.g. every building fire gets lights & sirens, as in US practice
+
+
+def response_level(call: dict) -> str:
+    lvl = _response_level(call)
+    for p in call["slots"].get("problems", []):
+        if lvl != "O" and LEVEL_ORDER.index(MIN_LEVEL.get(p, "A")) > LEVEL_ORDER.index(lvl):
+            lvl = MIN_LEVEL[p]
+    return lvl
+
+
+def _response_level(call: dict) -> str:
+    sl, sev = call["slots"], int(call["severity"])
+    probs = sl.get("problems", [])
+    if sl.get("breathing") is False:
+        return "E"
+    if sl.get("trapped") is True or sl.get("weapon") is True or sev >= 5:
+        return "D"
+    if any(sl.get(k) is True for k in ("bleeding", "spreading", "touching_wire")) or sl.get("caller_safe") is False or sev == 4:
+        return "C"
+    if probs and all(DEPARTMENTS[d]["fleet"] is None for p in probs for d in PROBLEMS[p]["teams"]):
+        return "O"
+    return "B" if sev == 3 else "A"
+
+
+def run_card(call: dict, level: str) -> list[dict]:
+    """Call type + response level -> the units to send, each with the reason (repeated departments = more units)."""
+    sl = call["slots"]
+    probs = sl.get("problems", []) or ([call["dial_hint"]] if call.get("dial_hint") else [])
+    hi = LEVEL_ORDER.index(level)
+    injured = sl.get("bleeding") is True or sl.get("breathing") is False or sl.get("trapped") is True or "medical" in probs
+    many = (sl.get("people") or 0) >= 3
+    card = []
+
+    def add(dept, why):
+        if not any(c["dept"] == dept and c["why"] == why for c in card):
+            card.append({"dept": dept, "why": why})
+    for p in probs:
+        if p == "fire":
+            add("Fire & Rescue", "fire attack")
+            if hi >= LEVEL_ORDER.index("D"):
+                add("Fire & Rescue", "second engine: working fire / rescue")
+            if hi >= LEVEL_ORDER.index("C") or injured:
+                add("Ambulance (EMS)", "standby for burns and smoke injuries")
+            if hi >= LEVEL_ORDER.index("D"):
+                add("Police", "scene and traffic control")
+        elif p == "gas_leak":
+            add("Fire & Rescue", "gas leak: ventilate, remove ignition sources")
+            add("Gas Emergency", "shut off the gas supply")
+            if hi >= LEVEL_ORDER.index("C"):
+                add("Police", "evacuation and cordon")
+        elif p == "medical":
+            add("Ambulance (EMS)", "patient care and transport")
+            if level == "E":
+                add("Fire & Rescue", "first responder: CPR until the ambulance arrives")
+            if many and hi >= LEVEL_ORDER.index("D"):
+                add("Ambulance (EMS)", "second ambulance: several patients")
+        elif p == "road_accident":
+            add("Ambulance (EMS)", "patient care and transport")
+            add("Police", "traffic control and accident report")
+            if sl.get("trapped") is True:
+                add("Fire & Rescue", "extrication: free trapped people")
+            if many:
+                add("Ambulance (EMS)", "second ambulance: several patients")
+        elif p == "collapse":
+            add("Disaster Response", "search and rescue")
+            add("Fire & Rescue", "rescue support")
+            add("Ambulance (EMS)", "patient care")
+            if hi >= LEVEL_ORDER.index("D"):
+                add("Police", "cordon and crowd control")
+        elif p == "flood":
+            add("Disaster Response", "water rescue")
+            if injured or hi >= LEVEL_ORDER.index("C"):
+                add("Ambulance (EMS)", "patient care")
+        elif p == "crime":
+            add("Police", "respond to the crime")
+            if sl.get("weapon") is True or hi >= LEVEL_ORDER.index("D"):
+                add("Police", "backup unit: weapon or violence reported")
+            if injured:
+                add("Ambulance (EMS)", "staged nearby for the injured")
+        elif p == "women_safety":
+            add("Police", "protect the caller")
+            add("Women Helpline", "counselling and follow-up")
+            if injured:
+                add("Ambulance (EMS)", "patient care")
+        elif p == "child":
+            add("Police", "search for the child")
+            add("Child Helpline", "child protection follow-up")
+        elif p == "electric":
+            add("Electricity Board", "isolate the power line")
+            if hi >= LEVEL_ORDER.index("C"):
+                add("Fire & Rescue", "keep the scene safe")
+            if sl.get("touching_wire") is True or injured:
+                add("Ambulance (EMS)", "electric shock patient")
+    if not card and sl.get("location"):
+        add("Police", "unclear problem: police check")
+    return card
+
+
+def radio(call: dict, a_: dict, level: str) -> None:
+    """The dispatcher's radio call to a unit (kept as the radio log)."""
+    lv = LEVELS[level]
+    probs = ", ".join(PROBLEMS[p]["label"].lower() for p in call["slots"].get("problems", [])) or "check the caller"
+    txt = (f"{a_['unit']}, respond {lv[2].lower()} to {call['slots'].get('location')}: {probs}, level {lv[0]}. {a_['why'].capitalize()}."
+           if a_.get("unit") else f"{a_['dept']}: ticket {a_.get('ticket') or ''}, {a_['why']}.")
+    call.setdefault("radio", []).append((time.time(), a_["icon"], txt))
+
+
+def cad_dispatch(call: dict, hindi: bool) -> list[str]:
+    """Send whatever the run card needs and is not yet assigned. Returns what to tell the caller."""
+    sl, level = call["slots"], response_level(call)
+    old = call.get("level")
+    call["level"] = level
+    card = run_card(call, level)
+    call["run_card"] = card
+    have = [(a_["dept"], a_["why"]) for a_ in call["assignments"]]
+    need = [c for c in card if (c["dept"], c["why"]) not in have]
+    out = []
+    if old and LEVEL_ORDER.index(level) > LEVEL_ORDER.index(old):
+        add_event(call, "⬆️", f"Response level raised: {LEVELS[old][0]} → {LEVELS[level][0]}")
+    if not need:
+        return out
+    teams = [{"dept": c["dept"], "role": "lead" if not call["assignments"] and k == 0 else "support", "why": c["why"]}
+             for k, c in enumerate(need)]
+    sent = dispatch_departments(teams, sl.get("location"), call["ref"])
+    for a_ in sent:
+        a_["sent_at"], a_["speed"] = time.time(), cfg()["speed"]
+        radio(call, a_, level)
+    first = not call["assignments"]
+    call["assignments"] += sent
+    st.session_state.setdefault("dept_jobs", []).extend(
+        {**{k: v for k, v in a_.items() if k != "route"}, "problem": ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])) or "unclear",
+         "location": sl.get("location"), "severity": call["severity"]} for a_ in sent)
+    add_event(call, "🚨" if first else "➕", ("Dispatched (" if first else "Also sent (") + LEVELS[level][0] + "): "
+              + ", ".join(f"{a_.get('unit') or a_.get('ticket') or a_['dept']}" for a_ in sent))
+    names = ", ".join(dict.fromkeys(a_["dept"] for a_ in sent))
+    units = sorted([a_ for a_ in sent if a_.get("unit")], key=lambda a_: a_["eta"])
+    if first and units:
+        out.append(_l(SAY["sending"], hindi).format(teams=names, unit=units[0]["unit"], eta=max(1, round(units[0]["eta"]))))
+    elif first:
+        out.append(_l(SAY["extra"], hindi).format(teams=names))
+    else:
+        out.append(_l(SAY["extra"], hindi).format(teams=names))
+    return out
+
+
 def check_arrivals(call: dict) -> bool:
     """Connect the call with the teams. The first crew to arrive joins the call and finds the caller; later units join
     them. The call-taker never hangs up on a silent caller (unless "Hand over automatically" is chosen): it checks on them."""
@@ -1199,6 +1406,27 @@ def check_arrivals(call: dict) -> bool:
                     agent_say(call, _l(CREW_SAY["joined"], call["hindi"]).format(unit=f"{a_['icon']} {a_['unit']}", lead=lead["dept"]))
             elif c["announce"]:
                 agent_say(call, _l(SAY["arrived"], call["hindi"]).format(icon=a_["icon"], unit=a_["unit"], dept=a_["dept"], place=place))
+    hospital = "Central Hospital"
+    for a_ in units:
+        if a_.get("arrived") and not a_.get("arrived_at"):
+            a_["arrived_at"] = now
+        if a_["dept"] == "Ambulance (EMS)" and a_.get("arrived_at") and call["slots"].get("location") != hospital:
+            on_scene_min = (now - a_["arrived_at"]) / a_.get("speed", sim_seconds)
+            if a_.get("contact") and not a_.get("transport_at") and on_scene_min >= 4:
+                try:
+                    a_["transport_eta"] = max(1.0, route_minutes(make_city_graph(), LANDMARKS[call["slots"]["location"]], LANDMARKS[hospital]))
+                except Exception:
+                    a_["transport_eta"] = 6.0
+                a_["transport_at"] = now
+                add_event(call, "🏥", f"{a_['unit']} transporting the patient to {hospital}")
+                call.setdefault("radio", []).append((now, a_["icon"], f"{a_['unit']}: transporting one patient to {hospital}, "
+                                                                     f"about {a_['transport_eta']:.0f} minutes."))
+                changed = True
+            if a_.get("transport_at") and not a_.get("at_hospital") and                     (now - a_["transport_at"]) / a_.get("speed", sim_seconds) >= a_["transport_eta"]:
+                a_["at_hospital"] = True
+                add_event(call, "🏥", f"{a_['unit']} at {hospital}: patient handed to the hospital")
+                call.setdefault("radio", []).append((now, a_["icon"], f"{a_['unit']}: at {hospital}, patient handed over."))
+                changed = True
     all_there = bool(units) and all(a_.get("arrived") for a_ in units)
     if c["arrival"] != "crew" and all_there and not call["ended"] and not call.get("handover_asked"):
         call["handover_asked"] = now
@@ -1328,42 +1556,25 @@ def caller_says(call: dict, text: str) -> dict:
     if (sl.get("problems") or unclear) and sl.get("location") and not call["dispatched"]:
         rec = add_call(caller_text(call), tri, "Emergency call")
         call["record"] = rec["Call ID"]
-        run_ = run_agents(caller_text(call), tri, call["ref"], "Emergency call", hint=(sl.get("problems") or [None])[0])
-        for a_ in run_["assignments"]:
-            a_["sent_at"], a_["speed"] = time.time(), cfg()["speed"]
-        call["assignments"], call["dispatched"] = run_["assignments"], True
-        add_event(call, "🚨", "Dispatched: " + ", ".join(f"{a_['dept']} {a_.get('unit') or a_.get('ticket') or ''}".strip()
-                                                       for a_ in run_["assignments"]))
-        rec["assignments"], rec["teams"] = run_["assignments"], [a_["dept"] for a_ in run_["assignments"]]
-        units = sorted([a_ for a_ in run_["assignments"] if a_.get("unit")], key=lambda a_: a_["eta"])
-        teams = ", ".join(a_["dept"] for a_ in run_["assignments"])
-        if units:
-            rec["Help vehicle"] = units[0]["unit"]
-            parts.append(_l(SAY["sending"], hindi).format(teams=teams, unit=units[0]["unit"], eta=max(1, round(units[0]["eta"]))))
-        else:
-            parts.append((_l(SAY["queued"], hindi) + " ") if any(DEPARTMENTS[a_["dept"]]["fleet"] for a_ in run_["assignments"]) else "")
-            parts.append(_l(SAY["extra"], hindi).format(teams=teams))
+        # agents classify and route (traced); the CAD run card decides the actual units
+        run_ = run_agents(caller_text(call), tri, call["ref"], "Emergency call",
+                          hint=(sl.get("problems") or [call.get("dial_hint")])[0], dispatch=False)
+        parts += cad_dispatch(call, hindi)
+        call["dispatched"] = True
+        run_["assignments"] = call["assignments"]
+        rec["assignments"], rec["teams"] = call["assignments"], [a_["dept"] for a_ in call["assignments"]]
+        first_unit = next((a_ for a_ in sorted(call["assignments"], key=lambda a_: a_.get("eta") or 1e9) if a_.get("unit")), None)
+        if first_unit:
+            rec["Help vehicle"] = first_unit["unit"]
     elif call["dispatched"]:
-        # new problems in the conversation -> alert the extra departments
-        have = {a_["dept"] for a_ in call["assignments"]}
-        route = route_problem(caller_text(call), tri)
-        extra = [t_ for t_ in route["teams"] if t_["dept"] not in have]
-        if extra:
-            more = dispatch_departments(extra, sl.get("location"), call["ref"])
-            for a_ in more:
-                a_["sent_at"], a_["speed"] = time.time(), cfg()["speed"]
-            call["assignments"] += more
-            st.session_state.setdefault("dept_jobs", []).extend(
-                {**{k: v for k, v in a_.items() if k != "route"}, "problem": ", ".join(route["labels"]), "location": sl.get("location"),
-                 "severity": call["severity"]} for a_ in more)
-            parts.append(_l(SAY["extra"], hindi).format(teams=", ".join(a_["dept"] for a_ in more)))
-            add_event(call, "➕", "Also sent: " + ", ".join(f"{a_['dept']} {a_.get('unit') or a_.get('ticket') or ''}".strip() for a_ in more))
+        # new answers can raise the response level or reveal new problems: the run card adds the missing units
+        parts += cad_dispatch(call, hindi)
         if call["severity"] == 5 and old_sev < 5:
             parts.append(_l(SAY["upgraded"], hindi))
-            add_event(call, "⬆️", "Severity raised to 5: life in danger")
         rec = next((c for c in st.session_state.calls if c["Call ID"] == call["record"]), None)
         if rec:
             rec.update(severity=call["severity"], people=sl.get("people"), **{"Call text": caller_text(call)})
+            rec["assignments"], rec["teams"] = call["assignments"], [a_["dept"] for a_ in call["assignments"]]
     # life-saving instructions, each given once
     triggers = [("not_breathing", sl.get("breathing") is False), ("bleeding", sl.get("bleeding") is True),
                 ("gas", "gas_leak" in sl.get("problems", [])), ("fire", "fire" in sl.get("problems", [])),
@@ -1432,6 +1643,8 @@ CARD_CSS = """
 .unit .top{display:flex;align-items:center;gap:8px}.unit .top .eta{margin-left:auto;font-weight:800;font-variant-numeric:tabular-nums}
 .tl{list-style:none;margin:0;padding:0}.tl li{display:grid;grid-template-columns:58px 22px 1fr;gap:4px;font-size:.84rem;padding:3px 0}
 .tl time{opacity:.55;font-variant-numeric:tabular-nums}
+.cad{list-style:none;margin:6px 0 0;padding:0}.cad li{display:grid;grid-template-columns:24px 1fr auto;gap:6px;font-size:.86rem;
+  padding:5px 0;border-top:1px solid rgba(128,128,128,.18)}.cad li:first-child{border-top:0}
 </style>
 """
 
@@ -1493,9 +1706,11 @@ def incident_card_html(c_: dict) -> str:
             left = unit_left(a_, now)
             frac = 1 - left / a_["eta"] if a_["eta"] else 1
             stage = 3 if a_.get("contact") else 2 if left <= 0 else 1 if frac > 0.03 else 0
-            eta = "🤝 with caller" if a_.get("contact") else "✅ on scene" if left <= 0 else f"{max(1, math.ceil(left))} min"
+            eta = ("🏥 at hospital" if a_.get("at_hospital") else "🚑 transporting" if a_.get("transport_at") else
+                   "🤝 with caller" if a_.get("contact") else "✅ on scene" if left <= 0 else f"{max(1, math.ceil(left))} min")
             html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b>{' <span class=chip>lead</span>' if a_.get('role') == 'lead' else ''}"
                         f" <span style='opacity:.7'>{a_['unit']}</span><span class='eta'>{eta}</span></div>"
+                        f"<div style='font-size:.78rem;opacity:.7;margin-top:2px'>{a_.get('why', '')}</div>"
                         f"<div class='bar' style='margin-top:6px'><i style='width:{100 * min(1, frac):.0f}%;background:{'#3BB57E' if left <= 0 else '#1C5D99'}'></i></div>"
                         "<div class='steps'>" + "".join(f"<span class='{'on' if k <= stage else ''}'>{n}</span>"
                                                        for k, n in enumerate(["Dispatched", "On the way", "On scene", "With caller"])) + "</div></div>")
@@ -1503,6 +1718,24 @@ def incident_card_html(c_: dict) -> str:
             html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b> <span style='opacity:.7'>{a_.get('ticket') or ''}</span>"
                         f"<span class='eta' style='font-weight:600;opacity:.8'>{a_['status']}</span></div></div>")
     html.append("</div>")
+    # CAD decision: response level, run card and the radio log
+    if c_.get("level"):
+        lv = LEVELS[c_["level"]]
+        rows = []
+        for cd in c_.get("run_card", []):
+            a_ = next((x for x in c_["assignments"] if x["dept"] == cd["dept"] and x["why"] == cd["why"]), None)
+            what = (a_.get("unit") or a_.get("ticket") or a_["status"]) if a_ else "pending"
+            rows.append(f"<li><span>{DEPARTMENTS[cd['dept']]['icon']}</span><span><b>{cd['dept']}</b> · {cd['why']}</span>"
+                        f"<span style='opacity:.75'>{what}</span></li>")
+        radio_rows = "".join(f"<li><time>{time.strftime('%H:%M:%S', time.localtime(t_))}</time><span>📻</span><span>{tx}</span></li>"
+                             for t_, ic, tx in c_.get("radio", [])[-5:])
+        html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🧠</span><div><b>CAD decision</b><br>"
+                    "<span class='ref'>How the backend chose the units (911-style run card)</span></div></div>"
+                    f"<div class='sev'><span class='n' style='background:{lv[3]};font-size:1.05rem;padding:0 10px'>{lv[0]}</span>"
+                    f"<div><div style='font-weight:650'>{lv[1]}</div><div class='lbl'>Response: {lv[2]}</div></div></div>"
+                    "<ul class='cad'>" + "".join(rows) + "</ul>"
+                    + (f"<div class='k' style='font-size:.74rem;text-transform:uppercase;opacity:.6;margin-top:10px'>📻 Dispatch radio</div>"
+                       f"<ul class='tl'>{radio_rows}</ul>" if radio_rows else "") + "</div>")
     # timeline
     ev = c_.get("events", [])
     if ev:
@@ -2147,53 +2380,76 @@ tab_call, tab_dept, tab_acc, tab2 = st.tabs(["📞 Emergency call", "🏢 Depart
                                             "🚑 Dispatch board"])
 
 with tab_call:
-    st.markdown(
-        "<div style='background:linear-gradient(135deg,#15202B,#1C5D99);color:#fff;border-radius:18px;padding:16px 22px;margin-bottom:8px'>"
-        "<div style='font-size:1.5rem;font-weight:800'>📞 Emergency call · 112</div>"
-        "<div style='opacity:.9'>Talk to the call-taker as you would on the phone. It asks what happened and where, sends the right teams "
-        "as soon as it knows, keeps asking the important questions, and tells you what to do while help comes.</div></div>",
-        unsafe_allow_html=True)
-    sc1, sc2 = st.columns([4, 1])
-    sc1.caption("Training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
-    with sc2.popover("⚙️ Call settings"):
-        cur = cfg()
-        st.markdown("**Caller details**")
-        name_opts = {"early": "Early: right after help is sent", "end": "At the end, after the safety questions", "off": "Don't ask"}
-        n_ = st.radio("Ask the caller's name", list(name_opts), format_func=name_opts.get, index=list(name_opts).index(cur["name_when"]))
-        p_ = st.toggle("Ask for a call-back number", value=cur["ask_phone"])
-        st.markdown("**When the teams arrive**")
-        arr_opts = {"crew": "The crew joins the call and finds the caller (recommended)",
-                    "confirm": "Ask “can you see them?”, then hand over", "stay": "Stay on the line until the caller ends the call",
-                    "auto": "Hand over automatically"}
-        if cur["arrival"] not in arr_opts:
-            cur["arrival"] = "crew"
-        a_ = st.radio("Hand-over", list(arr_opts), format_func=arr_opts.get, index=list(arr_opts).index(cur["arrival"]))
-        an_ = st.toggle("Announce each arrival in the call", value=cur["announce"])
-        w_ = st.slider("Check on a silent caller after (seconds)", 15, 120, int(cur["wait"]), step=15,
-                       help="The call-taker asks “are you still on the line?”. It never hangs up on a caller, "
-                            "except with “Hand over automatically”.")
-        st.markdown("**Simulation**")
-        sp_ = st.slider("Travel speed: real seconds per simulated minute", 1.0, 10.0, float(cur["speed"]), step=0.5,
-                        help="Higher = vehicles take longer, so there is more time to talk.")
-        st.session_state.call_cfg = {"name_when": n_, "ask_phone": p_, "arrival": a_, "announce": an_, "wait": w_, "speed": sp_}
-        st.caption("Changes apply straight away; travel speed applies to vehicles sent after the change.")
+    st.markdown(DIALER_CSS, unsafe_allow_html=True)
     call = st.session_state.get("call")
     if call is None or call.get("ended") and st.session_state.get("call_closed_seen"):
-        c1, c2, c3 = st.columns([1.2, 1.2, 2])
-        lang_pick = c1.radio("Language", ["English", "हिन्दी (Hindi)"], horizontal=True, key="call_lang")
-        hands = c2.toggle("Hands-free", value=True, key="call_hands",
-                          help="The call-taker reads each question aloud, then the microphone starts listening by itself.")
-        if c3.button("📞 Start emergency call", type="primary", width="stretch"):
-            call = new_call(lang_pick.startswith("ह"))
-            agent_say(call, _l(CALL_Q["problem"], call["hindi"]))
-            call["asked"].append("problem")
-            st.session_state.call = call
-            st.session_state.call_closed_seen = False
-            st.rerun()
+        # ---------------- a phone: dial an emergency number ----------------
+        st.caption("Training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
+        dial = st.session_state.get("dial", "")
+        svc = DIAL_SERVICES.get(dial, (None,))[0]
+        with st.container(key="phone"):
+            st.markdown(f"<div class='dial-screen'><div class='num'>{dial or '&nbsp;'}</div>"
+                        f"<div class='svc'>{svc or ('Dial an emergency number' if not dial else '')}</div></div>", unsafe_allow_html=True)
+            for row in (["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["*", "0", "#"]):
+                cols = st.columns(3)
+                for col, k in zip(cols, row):
+                    if col.button(k, key=f"dial_k_{'star' if k == '*' else 'hash' if k == '#' else k}", width="stretch"):
+                        st.session_state.dial = (dial + k)[:12]
+                        st.rerun()
+            c1, c2, c3 = st.columns(3)
+            if c1.button("C", key="dial_clear", width="stretch", help="Clear"):
+                st.session_state.dial = ""
+                st.rerun()
+            call_now = c2.button("📞", key="dial_call", width="stretch", help="Call")
+            if c3.button("⌫", key="dial_back", width="stretch", help="Delete"):
+                st.session_state.dial = dial[:-1]
+                st.rerun()
+            lang_pick = st.radio("Language", ["English", "हिन्दी"], horizontal=True, key="call_lang", label_visibility="collapsed")
+        if call_now:
+            if dial not in DIAL_SERVICES:
+                st.error((f"{dial} is not an emergency number. " if dial else "") + "Dial 112, the single emergency number in India.")
+            else:
+                call = new_call(lang_pick.startswith("ह"))
+                call.update(phase="ringing", ring_start=time.time(), dialed=dial, dial_hint=DIAL_SERVICES[dial][1])
+                st.session_state.call, st.session_state.call_closed_seen, st.session_state.dial = call, False, ""
+                st.rerun()
         if call and call.get("ended"):
-            st.info(f"Last call {call['ref']} has ended. Start a new call when you need to.")
+            st.info(f"Last call {call['ref']} has ended.")
+    elif call.get("phase") == "ringing":
+        call.setdefault("ani", "+91 9" + "".join(str(random.randint(0, 9)) for _ in range(4)) + " " + "".join(str(random.randint(0, 9)) for _ in range(5)))
+        # ---------------- ringing, then connected ----------------
+        with st.container(key="phone"):
+            st.markdown(f"<div class='ring'><div class='bub'>📞</div><div class='t1'>Calling {call['dialed']}…</div>"
+                        f"<div class='t2'>{DIAL_SERVICES[call['dialed']][0]} · Ringing</div></div>", unsafe_allow_html=True)
+            if st.button("Cancel", key="ring_cancel", width="stretch"):
+                st.session_state.call = None
+                st.rerun()
+
+        @st.fragment(run_every=0.5)
+        def ringing() -> None:
+            c_ = st.session_state.get("call")
+            if c_ and c_.get("phase") == "ringing" and time.time() - c_["ring_start"] >= 2.8:
+                c_["phase"], c_["started"] = "connected", time.time()
+                c_["events"] = [("📞", f"Call from {c_['dialed']} connected to the 112 response centre", time.time())]
+                svc = DIAL_SERVICES[c_["dialed"]][0]
+                agent_say(c_, _l(CALL_Q["problem"], c_["hindi"]) if c_["dialed"] == "112" else _l(DIAL_GREETING, c_["hindi"]).format(svc=svc))
+                c_["asked"].append("problem")
+                st.rerun(scope="app")
+        ringing()
     else:
         check_arrivals(call)
+        if not call["ended"]:
+            bar1, bar2, bar3, bar4 = st.columns([3.2, 1.1, 1.1, 1.1])
+            bar1.markdown(f"<div class='callbar'><span class='dot'></span><div><b>Connected · {call.get('dialed', '112')}</b><br>"
+                          f"<span>112 Emergency Response Centre · Caller ID (ANI) {call.get('ani', 'withheld')}</span></div></div>",
+                          unsafe_allow_html=True)
+            bar2.toggle("🎤 Auto-listen", value=True, key="call_hands", help="After each question, the microphone listens by itself.")
+            bar3.toggle("🔊 Speaker", value=True, key="call_speaker", help="The call-taker's voice is read aloud.")
+            if bar4.button("End call", key="end_call", width="stretch"):
+                call["ended"], call["ended_by"], call["ended_at"] = True, "caller", time.time()
+                add_event(call, "🔚", "Call ended by the caller")
+                agent_say(call, _l(SAY["ended"], call["hindi"]).format(ref=call["ref"]))
+                st.rerun()
         left, right = st.columns([1.35, 1], gap="large")
         with left:
             box = st.container(height=430, border=True)
@@ -2215,7 +2471,8 @@ with tab_call:
                 if VOICE_TYPING is not None:
                     res = VOICE_TYPING(key=f"call_live_{lang}",
                                        data={"lang": lang, "say": last_agent["text"] if last_agent else "",
-                                             "say_id": f"{call['ref']}-{len(call['turns'])}", "auto": st.session_state.get("call_hands", True)},
+                                             "say_id": f"{call['ref']}-{len(call['turns'])}", "auto": st.session_state.get("call_hands", True),
+                                             "speak": st.session_state.get("call_speaker", True)},
                                        on_done_change=lambda: None, on_env_change=lambda: None)
                     done = getattr(res, "done", None)
                     if done and done.get("id") != st.session_state.get("call_live_id"):
@@ -2249,14 +2506,7 @@ with tab_call:
                     if answer[1]:
                         call["turns"][-2]["audio"] = answer[1]           # the caller's turn keeps its recording
                     st.rerun()
-                b1, b2 = st.columns(2)
-                if b1.button("🔚 End call", width="stretch"):
-                    call["ended"], call["ended_by"], call["ended_at"] = True, "caller", time.time()
-                    add_event(call, "🔚", "Call ended")
-                    agent_say(call, _l(SAY["ended"], call["hindi"]).format(ref=call["ref"]))
-                    st.rerun()
-                b2.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt",
-                                   "text/plain", width="stretch")
+                st.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt", "text/plain")
             else:
                 st.success(f"Call {call['ref']} ended. The teams keep working; you can still follow them on the right.")
                 d1, d2 = st.columns(2)
@@ -2284,7 +2534,7 @@ with tab_call:
                             call["feedback_done"] = send_feedback(call.get("dispatch_run") or (call.get("run_ids") or [None])[-1],
                                                                   scores, note, {"departments": should, "severity": sev_ok})
                             st.rerun()
-                if d2.button("📞 Start a new call", type="primary", width="stretch"):
+                if d2.button("📞 New call", type="primary", width="stretch"):
                     st.session_state.call_closed_seen = True
                     st.session_state.call = None
                     st.rerun()
