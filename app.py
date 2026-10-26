@@ -2460,38 +2460,32 @@ with tab_call:
     st.markdown(DIALER_CSS, unsafe_allow_html=True)
     call = st.session_state.get("call")
     if call is None or call.get("ended") and st.session_state.get("call_closed_seen"):
-        # ---------------- a phone: dial an emergency number ----------------
+        # ---------------- start screen ----------------
+        st.markdown(
+            "<div style='background:linear-gradient(135deg,#15202B,#1C5D99);color:#fff;border-radius:18px;padding:16px 22px;margin-bottom:8px'>"
+            "<div style='font-size:1.5rem;font-weight:800'>📞 Emergency call · 112</div>"
+            "<div style='opacity:.9'>Talk to the call-taker as you would on the phone. It asks what happened and where, sends the right teams "
+            "as soon as it knows, keeps asking the important questions, and tells you what to do while help comes.</div></div>",
+            unsafe_allow_html=True)
         st.caption("Training simulation: no real vehicle is sent. In a real emergency in India, call 112.")
-        dial = st.session_state.get("dial", "")
-        svc = DIAL_SERVICES.get(dial, (None,))[0]
-        with st.container(key="phone"):
-            st.markdown(f"<div class='dial-screen'><div class='num'>{dial or '&nbsp;'}</div>"
-                        f"<div class='svc'>{svc or ('Dial an emergency number' if not dial else '')}</div></div>", unsafe_allow_html=True)
-            for row in (["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["*", "0", "#"]):
-                cols = st.columns(3)
-                for col, k in zip(cols, row):
-                    if col.button(k, key=f"dial_k_{'star' if k == '*' else 'hash' if k == '#' else k}", width="stretch"):
-                        st.session_state.dial = (dial + k)[:12]
-                        st.rerun()
-            c1, c2, c3 = st.columns(3)
-            if c1.button("C", key="dial_clear", width="stretch", help="Clear"):
-                st.session_state.dial = ""
-                st.rerun()
-            call_now = c2.button("📞", key="dial_call", width="stretch", help="Call")
-            if c3.button("⌫", key="dial_back", width="stretch", help="Delete"):
-                st.session_state.dial = dial[:-1]
-                st.rerun()
-            lang_pick = st.radio("Language", ["English", "हिन्दी"], horizontal=True, key="call_lang", label_visibility="collapsed")
-        if call_now:
-            if dial not in DIAL_SERVICES:
-                st.error((f"{dial} is not an emergency number. " if dial else "") + "Dial 112, the single emergency number in India.")
-            else:
-                call = new_call(lang_pick.startswith("ह"))
-                call.update(phase="ringing", ring_start=time.time(), dialed=dial, dial_hint=DIAL_SERVICES[dial][1])
-                st.session_state.call, st.session_state.call_closed_seen, st.session_state.dial = call, False, ""
-                st.rerun()
+        c1, c2, c3 = st.columns([1.2, 1.2, 2])
+        lang_pick = c1.radio("Language", ["English", "हिन्दी (Hindi)"], horizontal=True, key="call_lang")
+        c2.toggle("Hands-free", value=True, key="call_hands",
+                  help="The call-taker reads each question aloud, then the microphone starts listening by itself.")
+        if c3.button("📞 Start emergency call", type="primary", width="stretch"):
+            call = new_call(lang_pick.startswith("ह"))
+            call["dialed"], call["dial_hint"] = "112", None
+            call["ani"] = "+91 9" + "".join(str(random.randint(0, 9)) for _ in range(4)) + " " + "".join(str(random.randint(0, 9)) for _ in range(5))
+            call["slots"]["phone"] = re.sub(r"\D", "", call["ani"])[-10:]       # the system already knows the number (ANI)
+            call["slots"]["phone_src"] = "ANI"
+            call["phase"], call["started"] = "connected", time.time()
+            call["events"] = [("📞", "Call connected to the 112 response centre", time.time())]
+            agent_say(call, _l(CALL_Q["problem"], call["hindi"]))
+            call["asked"].append("problem")
+            st.session_state.call, st.session_state.call_closed_seen = call, False
+            st.rerun()
         if call and call.get("ended"):
-            st.info(f"Last call {call['ref']} has ended.")
+            st.info(f"Last call {call['ref']} has ended. Start a new call when you need to.")
     elif call.get("phase") == "ringing":
         call.setdefault("ani", "+91 9" + "".join(str(random.randint(0, 9)) for _ in range(4)) + " " + "".join(str(random.randint(0, 9)) for _ in range(5)))
         # ---------------- ringing, then connected ----------------
