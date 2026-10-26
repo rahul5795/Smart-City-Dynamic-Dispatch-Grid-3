@@ -40,9 +40,14 @@ def ist(ts: float | None = None) -> datetime:
     return datetime.fromtimestamp(time.time() if ts is None else ts, tz=IST)
 
 
+def _ampm(d: datetime) -> str:
+    """12-hour clock with leading zero and AM/PM, independent of the server's language settings: 08:45:32 PM."""
+    return f"{(d.hour % 12) or 12:02d}:{d.minute:02d}:{d.second:02d} {'AM' if d.hour < 12 else 'PM'}"
+
+
 def ist_time(ts: float | None = None) -> str:
-    """24-hour clock, as used in Indian control-room logs: 14:06:07."""
-    return ist(ts).strftime("%H:%M:%S")
+    """Time of day in IST: 08:45:32 PM."""
+    return _ampm(ist(ts))
 
 
 def ist_date(ts: float | None = None) -> str:
@@ -51,14 +56,13 @@ def ist_date(ts: float | None = None) -> str:
 
 
 def ist_stamp(ts: float | None = None) -> str:
-    """Full stamp for records: 26-10-2026 14:06:07 IST."""
-    return ist(ts).strftime("%d-%m-%Y %H:%M:%S") + " IST"
+    """Full stamp: 26-10-2026 08:45:32 PM IST."""
+    return f"{ist_date(ts)} {ist_time(ts)} IST"
 
 
 def ist_human(ts: float | None = None) -> str:
-    """Friendly form for people: Mon, 26 Oct 2026, 2:06 PM IST."""
-    d = ist(ts)
-    return d.strftime("%a, %d %b %Y, ") + d.strftime("%I:%M %p").lstrip("0") + " IST"
+    """Same format everywhere: 26-10-2026 08:45:32 PM IST."""
+    return ist_stamp(ts)
 
 
 try:                                    # observability: traces, feedback and evaluations in LangSmith
@@ -1781,7 +1785,7 @@ CARD_CSS = """
 .steps span.on{border-top-color:#3BB57E;opacity:1;font-weight:700}
 .unit{padding:10px 0;border-top:1px solid rgba(128,128,128,.18)}.unit:first-of-type{border-top:0}
 .unit .top{display:flex;align-items:center;gap:8px}.unit .top .eta{margin-left:auto;font-weight:800;font-variant-numeric:tabular-nums}
-.tl{list-style:none;margin:0;padding:0}.tl li{display:grid;grid-template-columns:58px 22px 1fr;gap:4px;font-size:.84rem;padding:3px 0}
+.tl{list-style:none;margin:0;padding:0}.tl li{display:grid;grid-template-columns:88px 22px 1fr;gap:4px;font-size:.84rem;padding:3px 0}
 .tl time{opacity:.55;font-variant-numeric:tabular-nums}
 .facts{margin-top:8px;display:grid;gap:2px}
 .fr{display:grid;grid-template-columns:22px 104px 1fr auto;gap:6px;align-items:center;font-size:.84rem;padding:4px 0;
