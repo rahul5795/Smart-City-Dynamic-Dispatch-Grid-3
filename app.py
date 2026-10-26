@@ -919,6 +919,18 @@ def _l(pair: tuple[str, str], hindi: bool) -> str:
     return pair[1] if hindi else pair[0]
 
 
+def question_text(call: dict, q: str) -> str:
+    """The words for question q (the call-back question confirms the number the system already shows)."""
+    sl, hindi = call["slots"], call["hindi"]
+    if q == "phone" and sl.get("phone_src") == "ANI" and sl.get("phone"):
+        num = f"{sl['phone'][:5]} {sl['phone'][5:]}"
+        return (f"मेरी स्क्रीन पर आपका नंबर {num} दिख रहा है। क्या टीम आपको इसी नंबर पर वापस कॉल कर सकती है?" if hindi else
+                f"My screen shows your number as {num}. Can the team call you back on this number?")
+    if q == "phone" and "phone" in call["asked"]:
+        return "किस नंबर पर टीम आपको कॉल करे?" if hindi else "Which number should the team call you on?"
+    return _l(CALL_Q[q], hindi)
+
+
 def yes_no(text: str) -> bool | None:
     t = " " + re.sub(r"[^\w\u0900-\u097F' ]", " ", text.lower()) + " "
     if any(u in t for u in UNSURE):
@@ -951,6 +963,28 @@ def crew_say(call: dict, a_: dict, text: str) -> None:
     call["last_prompt_at"] = time.time()
 
 
+def clean_heard(text: str, call: dict) -> str:
+    """Remove the call-taker's own words picked up by the microphone (echo) and stuttered repeats."""
+    t = " ".join(text.split())
+    for turn in call["turns"][-3:]:
+        if turn["role"] == "caller":
+            continue
+        words = re.findall(r"[\w']+", turn["text"].lower())
+        for n in (8, 6, 5, 4):                                # remove any 4+ word run of the call-taker's sentence
+            for i in range(0, max(0, len(words) - n + 1)):
+                frag = r"\b" + r"\W+".join(map(re.escape, words[i:i + n])) + r"\b"
+                t = re.sub(frag, " ", t, flags=re.I)
+    words = t.split()
+    for n in (4, 3, 2, 1):                                    # "yellow cloth yellow cloth yellow cloth" -> "yellow cloth"
+        i = 0
+        while i + 2 * n <= len(words):
+            if [w.lower().strip(",.!?") for w in words[i:i + n]] == [w.lower().strip(",.!?") for w in words[i + n:i + 2 * n]]:
+                del words[i + n:i + 2 * n]
+            else:
+                i += 1
+    return " ".join(words).strip(" ,.")
+
+
 def caller_text(call: dict) -> str:
     return ". ".join(t_["text"] for t_ in call["turns"] if t_["role"] == "caller")
 
@@ -968,7 +1002,11 @@ def extract_into(call: dict, text: str) -> list[str]:
     elif pend == "phone":
         digits = re.sub(r"\D", "", text.translate(DEVANAGARI_DIGITS))
         if len(digits) >= 10:
-            sl["phone"] = digits[-10:]; got.append("phone")
+            sl["phone"], sl["phone_src"], sl["phone_ok"] = digits[-10:], "caller", True; got.append("phone")
+        elif sl.get("phone_src") == "ANI" and yes_no(text) is True:
+            sl["phone_ok"] = True; got.append("phone")           # "yes, this number is fine"
+        elif sl.get("phone_src") == "ANI" and yes_no(text) is False:
+            sl["phone"], sl["phone_src"] = None, None           # ask for another number next
         elif yes_no(text) is False or any(u in t for u in UNSURE):
             sl["phone"] = "not given"; got.append("phone")
     elif pend in ("description", "child_desc", "name") and len(text.strip()) > 1 and yes_no(text) is not False \
@@ -992,7 +1030,11 @@ def extract_into(call: dict, text: str) -> list[str]:
         sl["location"] = place; got.append("location")
     n = count_people(t)
     if n and n != sl.get("people"):
-        sl["people"] = n; got.append("people")
+        sl["people"], sl["people_src"] = n, "caller"; got.append("people")
+    elif not sl.get("people") and re.search(r"\b(my (father|mother|son|daughter|wife|husband|friend|brother|sister|grandfather|"
+                                             r"grandmother)|a (man|woman|boy|girl|child|person)|someone|somebody)\b|"
+                                             r"(मेरे पिता|मेरी माँ|मेरा बेटा|मेरी बेटी|एक आदमी|एक औरत|कोई)", t):
+        sl["people"], sl["people_src"] = 1, "inferred"
     flags = {"breathing": (["not breathing", "stopped breathing", "unconscious", "not moving", "behosh", "बेहोश", "सांस नहीं", "साँस नहीं"], False),
              "trapped": (["trapped", "stuck inside", "can't get out", "फंस", "फँस"], True),
              "bleeding": (["bleeding", "lot of blood", "खून"], True),
@@ -1031,7 +1073,8 @@ def _needs(call: dict, slot: str) -> bool:
     if slot == "name":
         return c["name_when"] != "off" and not sl.get("name") and asked.count("name") < 2
     if slot == "phone":
-        return c["ask_phone"] and not sl.get("phone") and asked.count("phone") < 2 and bool(sl.get("name") or "name" in asked or c["name_when"] == "off")
+        return (c["ask_phone"] and not sl.get("phone_ok") and sl.get("phone") != "not given" and asked.count("phone") < 2
+                and bool(sl.get("name") or "name" in asked or c["name_when"] == "off"))
     return False
 
 
@@ -1436,7 +1479,7 @@ def check_arrivals(call: dict) -> bool:
             hand_over(call, "All teams on scene: call handed over automatically")
         elif missing and call.get("pending") not in missing:
             call["pending"] = missing[0]; call["asked"].append(missing[0])
-            agent_say(call, _l(SAY["before_handover"], call["hindi"]) + " " + _l(CALL_Q[missing[0]], call["hindi"]))
+            agent_say(call, _l(SAY["before_handover"], call["hindi"]) + " " + question_text(call, missing[0]))
         elif not missing:
             call["pending"] = "handover_confirm"
             agent_say(call, _l(SAY["handover_q"], call["hindi"]).format(place=call["slots"].get("location") or "you"))
@@ -1497,7 +1540,7 @@ def caller_says(call: dict, text: str) -> dict:
             call["pending"] = q
             if q:
                 call["asked"].append(q)
-                agent_say(call, _l(CALL_Q[q], hindi))
+                agent_say(call, question_text(call, q))
             return {"reply": call["turns"][-1]["text"], "understood": ["crew_contact"], "severity": call["severity"]}
     if call.get("pending") == "anything_else":
         low = " " + re.sub(r"[^\w\u0900-\u097F' ]", " ", text.lower()) + " "
@@ -1607,7 +1650,7 @@ def caller_says(call: dict, text: str) -> dict:
     if q:
         call["asked"].append(q)
         call["pending"] = q
-        parts.append(_l(CALL_Q[q], hindi))
+        parts.append(question_text(call, q))
     else:
         call["pending"] = None
         parts.append(_l(SAY["done"], hindi))
@@ -1643,6 +1686,14 @@ CARD_CSS = """
 .unit .top{display:flex;align-items:center;gap:8px}.unit .top .eta{margin-left:auto;font-weight:800;font-variant-numeric:tabular-nums}
 .tl{list-style:none;margin:0;padding:0}.tl li{display:grid;grid-template-columns:58px 22px 1fr;gap:4px;font-size:.84rem;padding:3px 0}
 .tl time{opacity:.55;font-variant-numeric:tabular-nums}
+.facts{margin-top:8px;display:grid;gap:2px}
+.fr{display:grid;grid-template-columns:22px 104px 1fr auto;gap:6px;align-items:center;font-size:.84rem;padding:4px 0;
+  border-top:1px solid rgba(128,128,128,.14)}.fr:first-child{border-top:0}
+.fi{width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:.7rem;font-weight:800;background:rgba(128,128,128,.2)}
+.fi.ok{background:rgba(31,138,91,.25);color:#3BB57E}.fi.ask{background:rgba(201,138,12,.25);color:#E9B03A;animation:icb 1.2s infinite}
+.fl{opacity:.7}.fv{font-weight:650}.fs{font-size:.72rem;opacity:.55;text-align:right}
+.sys{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:12px;padding-top:10px;border-top:1px dashed rgba(128,128,128,.3);
+  font-size:.76rem;opacity:.8}
 .cad{list-style:none;margin:6px 0 0;padding:0}.cad li{display:grid;grid-template-columns:24px 1fr auto;gap:6px;font-size:.86rem;
   padding:5px 0;border-top:1px solid rgba(128,128,128,.18)}.cad li:first-child{border-top:0}
 </style>
@@ -1668,16 +1719,36 @@ def incident_card_html(c_: dict) -> str:
                                       ("caller_safe", True, "caller safe"), ("weapon", False, "no weapon")] if sl.get(key) is val]
     signs = "".join(f"<span class='chip red'>{d}</span>" for d in danger) + "".join(f"<span class='chip green'>{g}</span>" for g in safe)
     signs = signs or "<span class='v muted'>none reported</span>"
-    # information completeness: the five facts a call-taker needs
+    # information completeness: each fact with its live value and where it came from (caller / system / inferred)
     checked = any(sl.get(k) is not None for k in YES_NO)
-    facts = [("What", bool(sl.get("problems"))), ("Where", bool(sl.get("location"))), ("How many", bool(sl.get("people"))),
-             ("Danger checked", checked)]
-    if cfg()["name_when"] != "off":
-        facts.append(("Caller", bool(sl.get("name"))))
-    if cfg()["ask_phone"]:
-        facts.append(("Call-back no.", bool(sl.get("phone")) and sl.get("phone") != "not given"))
-    pct = round(100 * sum(ok for _, ok in facts) / len(facts))
-    fact_chips = "".join(f"<span class='chip {'green' if ok else ''}'>{'✓' if ok else '○'} {name}</span>" for name, ok in facts)
+    pend = c_.get("pending")
+    def fact(label, ok, value, src="", asking=False):
+        return {"label": label, "ok": ok, "value": value, "src": src, "asking": asking}
+    ph = sl.get("phone")
+    ph_txt = (f"{ph[:5]} {ph[5:]}" if ph and ph != "not given" else "not given" if ph == "not given" else "")
+    answered = [k.replace("_", " ") for k in YES_NO if sl.get(k) is not None]
+    facts = [
+        fact("What", bool(sl.get("problems")), ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])), "caller",
+             pend in ("problem", "problem_again")),
+        fact("Where", bool(sl.get("location")), sl.get("location") or "", "caller", pend in ("location", "location_again")),
+        fact("How many", bool(sl.get("people")), str(sl.get("people") or ""), sl.get("people_src", "caller"), pend == "people"),
+        fact("Danger checked", checked, ", ".join(danger + safe) or ", ".join(answered), "caller", pend in YES_NO),
+        fact("Caller", bool(sl.get("name")), sl.get("name") or "", "caller", pend == "name"),
+        fact("Call-back no.", bool(sl.get("phone_ok")), ph_txt,
+             ("system (ANI) · confirmed" if sl.get("phone_ok") else "system (ANI) · to confirm") if sl.get("phone_src") == "ANI"
+             else "caller" if ph and ph != "not given" else "", pend == "phone"),
+    ]
+    pct = round(100 * sum(f_["ok"] for f_ in facts) / len(facts))
+    fact_rows = "".join(
+        f"<div class='fr'><span class='fi {'ok' if f_['ok'] else 'ask' if f_['asking'] else ''}'>{'✓' if f_['ok'] else '…' if f_['asking'] else '○'}</span>"
+        f"<span class='fl'>{f_['label']}</span>"
+        f"<span class='fv'>{f_['value'] or ('asking now…' if f_['asking'] else 'not yet')}</span>"
+        f"<span class='fs'>{f_['src'] if f_['value'] else ''}</span></div>" for f_ in facts)
+    sysbox = (f"<div class='sys'><span>📟 <b>System</b></span><span>Caller ID (ANI): {c_.get('ani', 'withheld')}</span>"
+              f"<span>Received: {time.strftime('%H:%M:%S', time.localtime(c_['started']))}</span>"
+              f"<span>Dialled: {c_.get('dialed', '112')}</span><span>Line: mobile</span>"
+              f"<span>Language: {'Hindi' if c_.get('hindi') else 'English'}</span>"
+              f"<span>Location (ALI): {'from caller' if sl.get('location') else 'not available: ask the caller'}</span></div>")
     desc = (sl.get("child_desc") or "") + " " + (sl.get("description") or "")
     html = [CARD_CSS, "<div class='ic'>",
             f"<div class='ic-h'><span style='font-size:1.3rem'>📋</span><div><b>What the call-taker knows</b><br>"
@@ -1689,14 +1760,15 @@ def incident_card_html(c_: dict) -> str:
             f"<div class='f'><div class='k'>📍 Location</div><div class='v{'' if sl.get('location') else ' muted'}'>{sl.get('location') or 'not yet'}</div></div>",
             f"<div class='f'><div class='k'>👥 People</div><div class='v{'' if sl.get('people') else ' muted'}'>{sl.get('people') or 'not stated'}</div></div>",
             f"<div class='f'><div class='k'>🙋 Caller</div><div class='v{'' if sl.get('name') else ' muted'}'>{sl.get('name') or 'not given'}"
-            + (f"<div style='font-weight:500;opacity:.8;font-size:.85rem'>📱 ••••••{sl['phone'][-4:]}</div>" if sl.get("phone") and sl["phone"] != "not given" else "")
+            + (f"<div style='font-weight:500;opacity:.8;font-size:.85rem'>📱 {sl['phone'][:5]} {sl['phone'][5:]}"
+               f"{' ✓' if sl.get('phone_ok') else ''}</div>" if sl.get("phone") and sl["phone"] != "not given" else "")
             + "</div></div>",
             f"<div class='f' style='grid-column:1/-1'><div class='k'>⚠️ Danger signs</div><div class='v'>{signs}</div></div>",
             (f"<div class='f' style='grid-column:1/-1'><div class='k'>📝 Description</div><div class='v'>{desc.strip()}</div></div>" if desc.strip() else ""),
             "</div>",
-            f"<div class='prog'><div class='row'><span>Information collected</span><span>{pct}%</span></div>"
+            f"<div class='prog'><div class='row'><span>Information collected (live)</span><span>{pct}%</span></div>"
             f"<div class='bar'><i style='width:{pct}%;background:{'#3BB57E' if pct >= 80 else '#C98A0C' if pct >= 40 else '#E5484D'}'></i></div>"
-            f"<div style='margin-top:6px'>{fact_chips}</div></div></div>"]
+            f"<div class='facts'>{fact_rows}</div></div>{sysbox}</div>"]
     # teams
     html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🚨</span><b>Teams</b></div>")
     if not c_["assignments"]:
@@ -1881,7 +1953,7 @@ export default function (component) {
   const bars = [...parentElement.querySelectorAll('.vt-meter i')];
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   const lang = (data && data.lang) || 'en-IN';
-  const MAX_MS = 90000;
+  const MAX_MS = (data && data.auto) ? 30000 : 90000;     // one answer in a conversation is short
   let s = null;
   const say = (html, err) => { status.innerHTML = html; status.classList.toggle('err', !!err); };
   const report = (extra) => { try { setStateValue('env', Object.assign(env, extra || {})); } catch (e) {} };
@@ -1915,7 +1987,10 @@ export default function (component) {
   const sayText = data && data.say, sayId = data && data.say_id;
   if (sayText && sayId != null && parentElement.__said !== sayId) {
     parentElement.__said = sayId;
-    const listenNext = () => { if (data.auto && !s) start(); };
+    // a new question: stop any listening first, so the microphone never records the call-taker's own voice
+    if (s) { s.stopped = true; s.discard = true; try { s.rec && s.rec.abort(); } catch (e) {} cleanup(s); s = null;
+             btn.classList.remove('on'); btn.disabled = false; lbl.textContent = 'Start speaking'; }
+    const listenNext = () => { if (data.auto && !s) setTimeout(() => { if (!s) start(); }, 350); };
     if ('speechSynthesis' in window && data.speak !== false) {
       try {
         speechSynthesis.cancel();
@@ -1973,6 +2048,7 @@ export default function (component) {
     try { r = new SR(); } catch (e) { return; }
     sess.rec = r; r.lang = lang; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
     r.onresult = (e) => {
+      if ('speechSynthesis' in window && speechSynthesis.speaking) return;   // that is our own voice
       if (s !== sess) return;
       let fin = '', int = '';
       for (let i = e.resultIndex; i < e.results.length; i++) { const x = e.results[i]; if (x.isFinal) fin += x[0].transcript + ' '; else int += x[0].transcript; }
@@ -2003,6 +2079,7 @@ export default function (component) {
   }
 
   function maybeFinish(sess) {
+    if (sess.discard) return;
     if (!sess.stopped || !sess.recDone || sess.sent) return;
     sess.sent = true;
     const text = (sess.finals + (sess.interim || '')).replace(/\s+/g, ' ').trim();
@@ -2430,6 +2507,8 @@ with tab_call:
             c_ = st.session_state.get("call")
             if c_ and c_.get("phase") == "ringing" and time.time() - c_["ring_start"] >= 2.8:
                 c_["phase"], c_["started"] = "connected", time.time()
+                c_["slots"]["phone"] = re.sub(r"\D", "", c_.get("ani", ""))[-10:] or None   # the system already knows the number
+                c_["slots"]["phone_src"] = "ANI"
                 c_["events"] = [("📞", f"Call from {c_['dialed']} connected to the 112 response centre", time.time())]
                 svc = DIAL_SERVICES[c_["dialed"]][0]
                 agent_say(c_, _l(CALL_Q["problem"], c_["hindi"]) if c_["dialed"] == "112" else _l(DIAL_GREETING, c_["hindi"]).format(svc=svc))
@@ -2478,7 +2557,7 @@ with tab_call:
                     if done and done.get("id") != st.session_state.get("call_live_id"):
                         st.session_state.call_live_id = done["id"]
                         audio = base64.b64decode(done["audio"]) if done.get("audio") else None
-                        text = (done.get("text") or "").strip()
+                        text = clean_heard((done.get("text") or "").strip(), call)
                         if not text and audio and wav_stats(audio)["peak"] >= 0.01:
                             try:
                                 text, _eng = transcribe_audio(audio, lang, groq_key, whisper_model)
@@ -2520,7 +2599,7 @@ with tab_call:
                     else:
                         ok = st.feedback("thumbs", key=f"fb_ok_{call['ref']}")
                         sent = [a_["dept"] for a_ in call["assignments"]]
-                        should = st.multiselect("Departments that should have been sent", list(DEPARTMENTS), default=sent,
+                        should = st.multiselect("Departments that should have been sent", list(DEPARTMENTS), default=list(dict.fromkeys(sent)),
                                                 key=f"fb_dep_{call['ref']}")
                         sev_ok = st.select_slider("Correct severity", options=[1, 2, 3, 4, 5], value=call["severity"],
                                                   key=f"fb_sev_{call['ref']}")
