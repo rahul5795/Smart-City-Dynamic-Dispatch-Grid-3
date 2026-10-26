@@ -1550,15 +1550,28 @@ def _secret(name: str) -> str:
     """Read a key from Streamlit Secrets or the environment, never from the page."""
     try:
         if name in st.secrets:
-            return str(st.secrets[name])
+            return str(st.secrets[name]).strip().strip('"').strip("'").strip()
+        for section in st.secrets.values():                 # also accept [langsmith] / [groq] style sections
+            if hasattr(section, "get") and section.get(name):
+                return str(section.get(name)).strip().strip('"').strip("'").strip()
     except Exception:
         pass
-    return os.getenv(name, "")
+    return os.getenv(name, "").strip()
 
 
 def setup_langsmith():
     """Switch tracing on only when a LangSmith key is in Secrets; otherwise everything still works, untraced."""
+    global ls_reason
     key = _secret("LANGSMITH_API_KEY") or _secret("LANGCHAIN_API_KEY")
+    if langsmith is None:
+        ls_reason = ("The **langsmith** package is not installed on the server. Add the line `langsmith>=0.3` to "
+                     "**requirements.txt** in your GitHub repository, then reboot the app.")
+    elif not key:
+        ls_reason = ("No **LANGSMITH_API_KEY** was found in Secrets. Check the spelling (all capitals, underscores), that it is "
+                     "saved, and that the app was rebooted after saving.")
+    elif not key.startswith("lsv2_"):
+        ls_reason = "The LANGSMITH_API_KEY in Secrets does not look like a LangSmith key (it should start with `lsv2_`)."
+        key = ""
     if langsmith is None or not key:
         os.environ["LANGSMITH_TRACING"] = "false"
         return None, None
@@ -1584,6 +1597,7 @@ def _ls_client(key: str, project: str, endpoint: str):
         return None
 
 
+ls_reason = ""
 ls_client, ls_project = setup_langsmith()
 
 
@@ -1932,7 +1946,21 @@ with tab_dept:
 
 with tab_acc:
     st.subheader("Accuracy & observability (LangSmith)")
+    if not ls_client and ls_reason:
+        st.error("Why it is not connected: " + ls_reason)
     if ls_client:
+        if st.button("🔌 Test the LangSmith connection"):
+            try:
+                list(ls_client.list_projects(limit=1))
+                st.success("The key works: LangSmith answered. Make a call, then look in Workspace 1 → Tracing projects → "
+                           f"{ls_project}.")
+            except Exception as exc:
+                msg = str(exc)
+                hint = (" The key was rejected: it may be deleted, expired, or for another workspace. Create a new key and update Secrets."
+                        if "401" in msg or "403" in msg or "nauthorized" in msg or "orbidden" in msg else
+                        " If your LangSmith account is in the EU, add LANGSMITH_ENDPOINT = \"https://eu.api.smith.langchain.com\" to Secrets."
+                        if "404" in msg or "onnection" in msg else "")
+                st.error(f"LangSmith did not accept the connection: {msg[:200]}.{hint}")
         st.success(f"LangSmith is connected. Every call is traced in project **{ls_project}**: each agent's input, output and time, "
                    "with a call's turns grouped as one thread. Open https://smith.langchain.com to explore them.")
     else:
