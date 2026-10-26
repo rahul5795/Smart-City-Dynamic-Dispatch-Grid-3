@@ -931,7 +931,12 @@ def new_call(hindi: bool) -> dict:
     st.session_state.call_no = st.session_state.get("call_no", 0) + 1
     return {"ref": f"112-{st.session_state.call_no:03d}", "hindi": hindi, "turns": [], "slots": {}, "asked": [], "pending": "problem",
             "misses": {}, "dispatched": False, "assignments": [], "severity": 3, "record": None, "ended": False,
-            "started": time.time(), "said_instructions": []}
+            "started": time.time(), "said_instructions": [], "events": [("📞", "Call started", time.time())]}
+
+
+def add_event(call: dict, icon: str, text: str) -> None:
+    """The incident timeline shown to the dispatcher (and kept in the transcript)."""
+    call.setdefault("events", []).append((icon, text, time.time()))
 
 
 def agent_say(call: dict, text: str) -> None:
@@ -955,8 +960,10 @@ def extract_into(call: dict, text: str) -> list[str]:
     elif pend in ("description", "child_desc", "name") and len(text.strip()) > 1 and yes_no(text) is not False:
         val = text.strip()
         if pend == "name":
-            m_ = re.search(r"(?:my name is|name is|i am|i'm|this is|mera naam|मेरा नाम)\s+([^\s,.]+)", val, flags=re.I)
-            val = (m_.group(1) if m_ else val.split()[0]).strip().title()
+            m_ = re.search(r"(?:my name is|name is|i am|i'm|this is|mera naam|मेरा नाम)\s+([^\d,.!?।]+)", val, flags=re.I)
+            words = (m_.group(1) if m_ else val).split()
+            words = [w for w in words if w.lower() not in ("है", "hai", "hoon", "हूँ", "हूं", "ji", "जी", "sir")]
+            val = " ".join(words[:3]).strip().title() or val.strip()
         sl[pend] = val; got.append(pend)
     # anything else the caller volunteered
     probs = [p for p, _ in rule_problems(text)]
@@ -1020,6 +1027,57 @@ def next_question(call: dict) -> str | None:
     return None
 
 
+ETA_WORDS = ["how long", "how much time", "when will", "where is the", "eta", "are they coming", "kitni der", "kab aayega",
+             "kab ayega", "kab aayegi", "कितनी देर", "कब आएगी", "कब आएगा", "कब तक", "कहाँ है", "कहां है"]
+SAY.update({
+    "eta_one": ("{unit} ({dept}) is about {mins} minutes away.", "{unit} ({dept}) लगभग {mins} मिनट दूर है।"),
+    "eta_here": ("{unit} ({dept}) has already reached you.", "{unit} ({dept}) आपके पास पहुँच चुकी है।"),
+    "eta_none": ("Help is being arranged; I will tell you as soon as a unit is on its way.",
+                 "मदद की व्यवस्था हो रही है; गाड़ी निकलते ही मैं आपको बताऊँगा।"),
+    "arrived": ("{icon} {unit} from {dept} has reached {place}. Please go to them or wave so they can see you, and follow their instructions.",
+                "{icon} {dept} की {unit} {place} पहुँच गई है। कृपया उनके पास जाएँ या हाथ हिलाएँ ताकि वे आपको देख सकें, और उनके निर्देश मानें।"),
+    "handover": ("All teams are with you now, so I am handing you over to them. Your reference is {ref}. Stay safe.",
+                 "सभी टीमें अब आपके पास हैं, इसलिए मैं आपको उन्हें सौंप रहा हूँ। आपका संदर्भ {ref} है। सुरक्षित रहें।"),
+})
+
+
+def unit_left(a_: dict, now: float | None = None) -> float:
+    """Simulated minutes until this unit arrives (0 when it is there)."""
+    now = now or time.time()
+    return max(0.0, a_["eta"] - (now - a_.get("sent_at", now)) / sim_seconds)
+
+
+def eta_reply(call: dict) -> str:
+    hindi, units = call["hindi"], [a_ for a_ in call["assignments"] if a_.get("unit")]
+    if not units:
+        return _l(SAY["eta_none"], hindi)
+    lines = []
+    for a_ in sorted(units, key=unit_left):
+        left = unit_left(a_)
+        lines.append((_l(SAY["eta_here"], hindi) if left <= 0 else _l(SAY["eta_one"], hindi)).format(
+            unit=a_["unit"], dept=a_["dept"], mins=max(1, math.ceil(left))))
+    return " ".join(lines)
+
+
+def check_arrivals(call: dict) -> bool:
+    """Connect the call with the teams: announce each arrival in the call, then hand over when everyone is there."""
+    changed, now = False, time.time()
+    units = [a_ for a_ in call.get("assignments", []) if a_.get("unit")]
+    for a_ in units:
+        if not a_.get("arrived") and unit_left(a_, now) <= 0:
+            a_["arrived"], changed = True, True
+            add_event(call, a_["icon"], f"{a_['unit']} ({a_['dept']}) arrived")
+            if not call["ended"]:
+                agent_say(call, _l(SAY["arrived"], call["hindi"]).format(
+                    icon=a_["icon"], unit=a_["unit"], dept=a_["dept"], place=call["slots"].get("location") or "you"))
+    if units and all(a_.get("arrived") for a_ in units) and not call["ended"]:
+        agent_say(call, _l(SAY["handover"], call["hindi"]).format(ref=call["ref"]))
+        call["ended"], call["ended_by"], call["ended_at"] = True, "handover", time.time()
+        add_event(call, "🤝", "All teams on scene: call handed over")
+        changed = True
+    return changed
+
+
 @traceable(run_type="chain", name="Call-taker turn",
            process_inputs=lambda i: {"caller": i.get("text"), "ref": i["call"]["ref"], "asked": i["call"].get("pending"),
                                      "language": "hi" if i["call"].get("hindi") else "en"})
@@ -1027,11 +1085,24 @@ def caller_says(call: dict, text: str) -> dict:
     """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
     hindi = call["hindi"]
     call["turns"].append({"role": "caller", "text": text.strip(), "t": time.strftime("%H:%M:%S")})
+    if any(w in text.lower() for w in ETA_WORDS) and call["dispatched"]:
+        # "how long will they take?": answer from the live position of the units, then repeat the open question
+        reply = eta_reply(call)
+        if call.get("pending"):
+            reply += " " + _l(CALL_Q[call["pending"]], hindi)
+        agent_say(call, reply)
+        return {"reply": reply, "understood": ["eta_question"], "severity": call["severity"]}
     got = extract_into(call, text)
     sl = call["slots"]
     parts = []
     if not got and call.get("pending") not in ("description", "child_desc", "name"):
         call["misses"][call.get("pending")] = call["misses"].get(call.get("pending"), 0) + 1
+    if "problems" in got:
+        add_event(call, "🔎", "Problem: " + ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])))
+    if "location" in got:
+        add_event(call, "📍", f"Location confirmed: {sl.get('location')}")
+    if "name" in got:
+        add_event(call, "🙋", f"Caller: {sl.get('name')}")
     if "problems" in got or "location" in got:
         what = ", ".join((PROBLEM_HI.get(p, PROBLEMS[p]["label"]) if hindi else PROBLEMS[p]["label"].lower())
                          for p in sl.get("problems", [])) or ("आपात स्थिति" if hindi else "an emergency")
@@ -1054,6 +1125,8 @@ def caller_says(call: dict, text: str) -> dict:
         for a_ in run_["assignments"]:
             a_["sent_at"] = time.time()
         call["assignments"], call["dispatched"] = run_["assignments"], True
+        add_event(call, "🚨", "Dispatched: " + ", ".join(f"{a_['dept']} {a_.get('unit') or a_.get('ticket') or ''}".strip()
+                                                       for a_ in run_["assignments"]))
         rec["assignments"], rec["teams"] = run_["assignments"], [a_["dept"] for a_ in run_["assignments"]]
         units = sorted([a_ for a_ in run_["assignments"] if a_.get("unit")], key=lambda a_: a_["eta"])
         teams = ", ".join(a_["dept"] for a_ in run_["assignments"])
@@ -1077,8 +1150,10 @@ def caller_says(call: dict, text: str) -> dict:
                 {**{k: v for k, v in a_.items() if k != "route"}, "problem": ", ".join(route["labels"]), "location": sl.get("location"),
                  "severity": call["severity"]} for a_ in more)
             parts.append(_l(SAY["extra"], hindi).format(teams=", ".join(a_["dept"] for a_ in more)))
+            add_event(call, "➕", "Also sent: " + ", ".join(f"{a_['dept']} {a_.get('unit') or a_.get('ticket') or ''}".strip() for a_ in more))
         if call["severity"] == 5 and old_sev < 5:
             parts.append(_l(SAY["upgraded"], hindi))
+            add_event(call, "⬆️", "Severity raised to 5: life in danger")
         rec = next((c for c in st.session_state.calls if c["Call ID"] == call["record"]), None)
         if rec:
             rec.update(severity=call["severity"], people=sl.get("people"), **{"Call text": caller_text(call)})
@@ -1108,6 +1183,106 @@ def caller_says(call: dict, text: str) -> dict:
             "teams": [a_["dept"] for a_ in call["assignments"]], "next_question": call.get("pending")}
 
 
+CARD_CSS = """
+<style>
+.ic{border:1px solid rgba(128,128,128,.28);border-radius:16px;padding:14px 16px;margin-bottom:12px;background:rgba(128,128,128,.05)}
+.ic-h{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.ic-h b{font-size:1.05rem}.ic-h .ref{opacity:.65;font-size:.85rem}
+.pill{margin-left:auto;font-size:.78rem;font-weight:700;border-radius:999px;padding:3px 10px;white-space:nowrap}
+.pill.live{background:rgba(214,40,57,.15);color:#E5484D}.pill.live:before{content:"● ";animation:icb 1s infinite}
+.pill.done{background:rgba(31,138,91,.15);color:#3BB57E}
+@keyframes icb{50%{opacity:.2}}
+.sev{display:flex;align-items:center;gap:10px;margin:2px 0 12px}
+.sev .n{font-size:1.6rem;font-weight:800;color:#fff;border-radius:10px;padding:0 12px;line-height:2.1rem}
+.sev .bars{display:flex;gap:3px}.sev .bars i{width:22px;height:8px;border-radius:3px;background:rgba(128,128,128,.25)}
+.sev .lbl{font-size:.88rem;opacity:.85}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 14px}
+.f .k{font-size:.74rem;text-transform:uppercase;letter-spacing:.04em;opacity:.6}
+.f .v{font-weight:650;margin-top:2px}.f .v.muted{opacity:.45;font-weight:500}
+.chip{display:inline-block;border-radius:999px;padding:2px 9px;margin:2px 4px 0 0;font-size:.8rem;font-weight:650;background:rgba(128,128,128,.15)}
+.chip.red{background:rgba(214,40,57,.16);color:#E5484D}.chip.green{background:rgba(31,138,91,.16);color:#3BB57E}
+.prog{margin-top:12px}.prog .row{display:flex;justify-content:space-between;font-size:.78rem;opacity:.75;margin-bottom:4px}
+.bar{height:7px;border-radius:4px;background:rgba(128,128,128,.22);overflow:hidden}.bar i{display:block;height:100%;border-radius:4px}
+.steps{display:flex;gap:4px;margin-top:6px}.steps span{flex:1;font-size:.68rem;text-align:center;padding-top:5px;border-top:3px solid rgba(128,128,128,.25);opacity:.6}
+.steps span.on{border-top-color:#3BB57E;opacity:1;font-weight:700}
+.unit{padding:10px 0;border-top:1px solid rgba(128,128,128,.18)}.unit:first-of-type{border-top:0}
+.unit .top{display:flex;align-items:center;gap:8px}.unit .top .eta{margin-left:auto;font-weight:800;font-variant-numeric:tabular-nums}
+.tl{list-style:none;margin:0;padding:0}.tl li{display:grid;grid-template-columns:58px 22px 1fr;gap:4px;font-size:.84rem;padding:3px 0}
+.tl time{opacity:.55;font-variant-numeric:tabular-nums}
+</style>
+"""
+
+
+def incident_card_html(c_: dict) -> str:
+    """The dispatcher's live view of a call: facts, completeness, teams and timeline."""
+    sl, now = c_["slots"], time.time()
+    sev = int(c_["severity"])
+    if c_["ended"]:
+        c_.setdefault("ended_at", now)
+    secs = int((c_["ended_at"] if c_["ended"] else now) - c_["started"])
+    status = (f"<span class='pill done'>Handed over · {secs // 60}:{secs % 60:02d}</span>" if c_.get("ended_by") == "handover" else
+              f"<span class='pill done'>Ended · {secs // 60}:{secs % 60:02d}</span>" if c_["ended"] else
+              f"<span class='pill live'>On call · {secs // 60}:{secs % 60:02d}</span>")
+    bars = "".join(f"<i style='background:{SEV_COLOR.get(sev)}'></i>" if k < sev else "<i></i>" for k in range(5))
+    probs = "".join(f"<span class='chip'>{PROBLEMS[p]['label']}</span>" for p in sl.get("problems", [])) or "<span class='v muted'>listening…</span>"
+    danger = [lbl for key, val, lbl in [("breathing", False, "not breathing"), ("trapped", True, "trapped"), ("bleeding", True, "heavy bleeding"),
+                                        ("spreading", True, "spreading"), ("weapon", True, "weapon"), ("caller_safe", False, "caller not safe"),
+                                        ("touching_wire", True, "touching wire")] if sl.get(key) is val]
+    safe = [lbl for key, val, lbl in [("breathing", True, "breathing"), ("bleeding", False, "no heavy bleeding"), ("trapped", False, "nobody trapped"),
+                                      ("caller_safe", True, "caller safe"), ("weapon", False, "no weapon")] if sl.get(key) is val]
+    signs = "".join(f"<span class='chip red'>{d}</span>" for d in danger) + "".join(f"<span class='chip green'>{g}</span>" for g in safe)
+    signs = signs or "<span class='v muted'>none reported</span>"
+    # information completeness: the five facts a call-taker needs
+    checked = any(sl.get(k) is not None for k in YES_NO)
+    facts = [("What", bool(sl.get("problems"))), ("Where", bool(sl.get("location"))), ("How many", bool(sl.get("people"))),
+             ("Danger checked", checked), ("Caller", bool(sl.get("name")))]
+    pct = round(100 * sum(ok for _, ok in facts) / len(facts))
+    fact_chips = "".join(f"<span class='chip {'green' if ok else ''}'>{'✓' if ok else '○'} {name}</span>" for name, ok in facts)
+    desc = (sl.get("child_desc") or "") + " " + (sl.get("description") or "")
+    html = [CARD_CSS, "<div class='ic'>",
+            f"<div class='ic-h'><span style='font-size:1.3rem'>📋</span><div><b>What the call-taker knows</b><br>"
+            f"<span class='ref'>Incident {c_['ref']}</span></div>{status}</div>",
+            f"<div class='sev'><span class='n' style='background:{SEV_COLOR.get(sev)}'>{sev}</span><div><div class='bars'>{bars}</div>"
+            f"<div class='lbl'>{SEVERITY_GUIDE.get(sev, '')}</div></div></div>",
+            "<div class='grid'>",
+            f"<div class='f'><div class='k'>🔥 Problem</div><div class='v'>{probs}</div></div>",
+            f"<div class='f'><div class='k'>📍 Location</div><div class='v{'' if sl.get('location') else ' muted'}'>{sl.get('location') or 'not yet'}</div></div>",
+            f"<div class='f'><div class='k'>👥 People</div><div class='v{'' if sl.get('people') else ' muted'}'>{sl.get('people') or 'not stated'}</div></div>",
+            f"<div class='f'><div class='k'>🙋 Caller</div><div class='v{'' if sl.get('name') else ' muted'}'>{sl.get('name') or 'not given'}</div></div>",
+            f"<div class='f' style='grid-column:1/-1'><div class='k'>⚠️ Danger signs</div><div class='v'>{signs}</div></div>",
+            (f"<div class='f' style='grid-column:1/-1'><div class='k'>📝 Description</div><div class='v'>{desc.strip()}</div></div>" if desc.strip() else ""),
+            "</div>",
+            f"<div class='prog'><div class='row'><span>Information collected</span><span>{pct}%</span></div>"
+            f"<div class='bar'><i style='width:{pct}%;background:{'#3BB57E' if pct >= 80 else '#C98A0C' if pct >= 40 else '#E5484D'}'></i></div>"
+            f"<div style='margin-top:6px'>{fact_chips}</div></div></div>"]
+    # teams
+    html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🚨</span><b>Teams</b></div>")
+    if not c_["assignments"]:
+        html.append("<div class='v muted'>Help is sent as soon as the call-taker knows what happened and where.</div>")
+    for a_ in c_["assignments"]:
+        if a_.get("unit"):
+            left = unit_left(a_, now)
+            frac = 1 - left / a_["eta"] if a_["eta"] else 1
+            stage = 2 if left <= 0 else 1 if frac > 0.03 else 0
+            eta = "✅ on scene" if left <= 0 else f"{max(1, math.ceil(left))} min"
+            html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b>{' <span class=chip>lead</span>' if a_.get('role') == 'lead' else ''}"
+                        f" <span style='opacity:.7'>{a_['unit']}</span><span class='eta'>{eta}</span></div>"
+                        f"<div class='bar' style='margin-top:6px'><i style='width:{100 * min(1, frac):.0f}%;background:{'#3BB57E' if left <= 0 else '#1C5D99'}'></i></div>"
+                        "<div class='steps'>" + "".join(f"<span class='{'on' if k <= stage else ''}'>{n}</span>"
+                                                       for k, n in enumerate(["Dispatched", "On the way", "On scene"])) + "</div></div>")
+        else:
+            html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b> <span style='opacity:.7'>{a_.get('ticket') or ''}</span>"
+                        f"<span class='eta' style='font-weight:600;opacity:.8'>{a_['status']}</span></div></div>")
+    html.append("</div>")
+    # timeline
+    ev = c_.get("events", [])
+    if ev:
+        html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🕒</span><b>Timeline</b></div><ul class='tl'>"
+                    + "".join(f"<li><time>{time.strftime('%H:%M:%S', time.localtime(t_))}</time><span>{ic}</span><span>{tx}</span></li>"
+                              for ic, tx, t_ in ev[-9:]) + "</ul></div>")
+    return "".join(html)
+
+
 def call_transcript(call: dict) -> str:
     lines = [f"Emergency call {call['ref']} ({time.strftime('%Y-%m-%d', time.localtime(call['started']))})"]
     for t_ in call["turns"]:
@@ -1115,7 +1290,8 @@ def call_transcript(call: dict) -> str:
     sl = call["slots"]
     lines += ["", "Summary:", f"  Problem: {', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or 'unclear'}",
               f"  Location: {sl.get('location') or 'unknown'}", f"  Severity: {call['severity']} of 5", f"  People: {sl.get('people') or 'not stated'}",
-              "  Teams: " + (", ".join(f"{a_['dept']} ({a_.get('unit') or a_.get('ticket') or a_.get('status')})" for a_ in call["assignments"]) or "none")]
+              "  Teams: " + (", ".join(f"{a_['dept']} ({a_.get('unit') or a_.get('ticket') or a_.get('status')})" for a_ in call["assignments"]) or "none"),
+              "", "Timeline:"] + [f"  {time.strftime('%H:%M:%S', time.localtime(t_))} {ic} {tx}" for ic, tx, t_ in call.get("events", [])]
     return "\n".join(lines)
 
 
@@ -1728,7 +1904,7 @@ whisper_model = "whisper-large-v3-turbo"     # Groq speech-to-text, used only wh
 triage_model = load_model(str(MODEL_FILE), MODEL_FILE.stat().st_mtime if MODEL_FILE.exists() else 0.0)
 use_model = triage_model is not None         # used automatically when triage_model.json is next to app.py
 closure_rows, closure_cols = [], []          # no simulated road closures
-sim_seconds = 2.0                            # demo speed: 2 real seconds per simulated minute
+sim_seconds = 4.0                            # demo speed: 4 real seconds per simulated minute (a 7-minute trip = 28 s)
 
 if "calls" not in st.session_state:
     st.session_state.calls = []
@@ -1764,6 +1940,7 @@ with tab_call:
         if call and call.get("ended"):
             st.info(f"Last call {call['ref']} has ended. Start a new call when you need to.")
     else:
+        check_arrivals(call)
         left, right = st.columns([1.35, 1], gap="large")
         with left:
             box = st.container(height=430, border=True)
@@ -1817,7 +1994,8 @@ with tab_call:
                     st.rerun()
                 b1, b2 = st.columns(2)
                 if b1.button("🔚 End call", width="stretch"):
-                    call["ended"] = True
+                    call["ended"], call["ended_by"], call["ended_at"] = True, "caller", time.time()
+                    add_event(call, "🔚", "Call ended")
                     agent_say(call, _l(SAY["ended"], call["hindi"]).format(ref=call["ref"]))
                     st.rerun()
                 b2.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt",
@@ -1860,42 +2038,9 @@ with tab_call:
                 c_ = st.session_state.get("call")
                 if not c_:
                     return
-                sl = c_["slots"]
-                with st.container(border=True):
-                    st.markdown(f"#### What the call-taker knows  \n<span style='opacity:.7'>Reference {c_['ref']}</span>", unsafe_allow_html=True)
-                    sev = c_["severity"]
-                    st.markdown(f"<span style='display:inline-block;background:{SEV_COLOR.get(sev)};color:#fff;border-radius:10px;padding:2px 12px;"
-                                f"font-size:1.4rem;font-weight:800'>{sev}</span> of 5 · {SEVERITY_GUIDE.get(sev, '')}", unsafe_allow_html=True)
-                    k1, k2 = st.columns(2)
-                    k1.markdown(f"**Problem**  \n{', '.join(PROBLEMS[p]['label'] for p in sl.get('problems', [])) or '…listening'}")
-                    k2.markdown(f"**Location**  \n{sl.get('location') or '…not yet'}")
-                    k3, k4 = st.columns(2)
-                    k3.markdown(f"**People**  \n{sl.get('people') or 'not stated'}")
-                    signs = [lbl for key, val, lbl in [("breathing", False, "not breathing"), ("trapped", True, "trapped"),
-                                                       ("bleeding", True, "heavy bleeding"), ("spreading", True, "spreading"),
-                                                       ("weapon", True, "weapon"), ("caller_safe", False, "caller not safe"),
-                                                       ("touching_wire", True, "touching wire")] if sl.get(key) is val]
-                    k4.markdown(f"**Danger signs**  \n{', '.join(signs) or 'none reported'}")
-                    if sl.get("description") or sl.get("child_desc"):
-                        st.markdown(f"**Description**  \n{sl.get('child_desc') or ''} {sl.get('description') or ''}")
-                    if sl.get("name"):
-                        st.markdown(f"**Caller**  \n{sl['name']}")
-                with st.container(border=True):
-                    st.markdown("#### Teams")
-                    if not c_["assignments"]:
-                        st.caption("Help is sent as soon as the call-taker knows what happened and where.")
-                    now = time.time()
-                    for a_ in c_["assignments"]:
-                        if a_.get("unit"):
-                            left_ = a_["eta"] - (now - a_.get("sent_at", now)) / sim_seconds
-                            state = f"{max(1, math.ceil(left_))} min away" if left_ > 0 else "✅ arrived"
-                            st.markdown(f"{a_['icon']} **{a_['dept']}**{' (lead)' if a_.get('role') == 'lead' else ''} · {a_['unit']} · {state}")
-                            if left_ > 0:
-                                st.progress(min(1.0, max(0.0, 1 - left_ / a_["eta"])))
-                        else:
-                            st.markdown(f"{a_['icon']} **{a_['dept']}** · {a_.get('ticket') or ''} {a_['status']}")
-                    if c_["assignments"]:
-                        st.caption("Every agent's decision is on the 🏢 Departments & agents tab.")
+                if check_arrivals(c_):
+                    st.rerun(scope="app")                       # a unit arrived: show (and say) it in the call
+                st.markdown(incident_card_html(c_), unsafe_allow_html=True)
             call_panel()
 
 with tab_dept:
