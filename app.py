@@ -966,11 +966,11 @@ def crew_say(call: dict, a_: dict, text: str) -> None:
 def clean_heard(text: str, call: dict) -> str:
     """Remove the call-taker's own words picked up by the microphone (echo) and stuttered repeats."""
     t = " ".join(text.split())
-    for turn in call["turns"][-3:]:
+    for turn in call["turns"][-8:]:
         if turn["role"] == "caller":
             continue
         words = re.findall(r"[\w']+", turn["text"].lower())
-        for n in (8, 6, 5, 4):                                # remove any 4+ word run of the call-taker's sentence
+        for n in (8, 6, 5, 4, 3):                             # remove any 3+ word run of the call-taker's sentences
             for i in range(0, max(0, len(words) - n + 1)):
                 frag = r"\b" + r"\W+".join(map(re.escape, words[i:i + n])) + r"\b"
                 t = re.sub(frag, " ", t, flags=re.I)
@@ -1028,7 +1028,11 @@ def extract_into(call: dict, text: str) -> list[str]:
     place = match_location(text)
     if place and place != sl.get("location"):
         sl["location"] = place; got.append("location")
-    n = count_people(t)
+    people_ctx = re.search(r"(\d+|\b(one|two|three|four|five|six|seven|eight|nine|ten|several|many|kai|bahut)\b|"
+                           r"एक|दो|तीन|चार|पांच|पाँच|छह|सात|आठ|नौ|दस|कई|बहुत)\s*(people|persons?|men|women|kids|children|injured|hurt|"
+                           r"trapped|inside|log|लोग|आदमी|व्यक्ति|घायल|बच्चे)", t)
+    n = count_people(t) if (call.get("pending") == "people" or people_ctx) and not re.search(
+        r"\b(minutes?|mins?|km|floor|gate|number|no\.|मिनट|नंबर|गेट|मंज़िल)\b", t) or people_ctx else None
     if n and n != sl.get("people"):
         sl["people"], sl["people_src"] = n, "caller"; got.append("people")
     elif not sl.get("people") and re.search(r"\b(my (father|mother|son|daughter|wife|husband|friend|brother|sister|grandfather|"
@@ -1216,7 +1220,7 @@ def looks_like_name(text: str) -> bool:
     """A reply to "what is your name?" that is really a name (not "he stopped breathing")."""
     if re.search(r"(?:my name is|name is|i am|i'm|this is|mera naam|मेरा नाम)", text, flags=re.I):
         return True
-    words = [w for w in re.sub(r"[,.!?।]", " ", text.lower()).split() if w not in ("है", "hai", "hoon", "हूँ", "हूं", "ji", "जी")]
+    words = [w for w in re.sub(r"[,.!?।]", " ", text.lower()).split() if w not in ("है", "hai", "hoon", "हूँ", "हूं", "ji", "जी", "sir")]
     not_name = {"he", "she", "they", "it", "is", "are", "has", "have", "was", "the", "not", "please", "help", "breathing", "bleeding",
                 "trapped", "stuck", "fire", "smoke", "hurt", "injured", "dying", "dead", "coming", "where", "वह", "वो", "हैं", "नहीं",
                 "मदद", "आग", "खून", "फँसा", "फंसा", "साँस", "सांस", "कहाँ"}
@@ -2059,7 +2063,9 @@ export default function (component) {
       try {
         speechSynthesis.cancel();
         const u = new SpeechSynthesisUtterance(sayText); u.lang = lang; u.rate = 1;
-        u.onend = listenNext; u.onerror = listenNext;
+        window.__ttsUntil = Date.now() + 2500 + sayText.length * 75;          // safety end, in case onend never fires
+        const done = () => { window.__ttsUntil = Date.now() + 250; listenNext(); };
+        u.onend = done; u.onerror = done;
         speechSynthesis.speak(u);
       } catch (e) { listenNext(); }
     } else { listenNext(); }
@@ -2112,7 +2118,7 @@ export default function (component) {
     try { r = new SR(); } catch (e) { return; }
     sess.rec = r; r.lang = lang; r.continuous = true; r.interimResults = true; r.maxAlternatives = 1;
     r.onresult = (e) => {
-      if ('speechSynthesis' in window && speechSynthesis.speaking) return;   // that is our own voice
+      if (window.__ttsUntil && Date.now() < window.__ttsUntil) return;     // that is the call-taker's own voice
       if (s !== sess) return;
       let fin = '', int = '';
       for (let i = e.resultIndex; i < e.results.length; i++) { const x = e.results[i]; if (x.isFinal) fin += x[0].transcript + ' '; else int += x[0].transcript; }
