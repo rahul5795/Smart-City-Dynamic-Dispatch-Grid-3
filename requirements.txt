@@ -2,6 +2,7 @@ streamlit>=1.51
 groq>=0.11.0
 networkx>=3.2
 pandas>=2.0
+numpy>=1.24
 matplotlib>=3.7
 SpeechRecognition>=3.10
 langsmith>=0.3
