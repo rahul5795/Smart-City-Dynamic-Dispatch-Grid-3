@@ -1088,6 +1088,12 @@ def next_question(call: dict) -> str | None:
         for slot in ("name", "phone"):
             if _needs(call, slot) and slot not in asked:
                 return slot
+        # the crew is with the caller, but the record still needs the key safety facts (at most two questions)
+        late = [q for p in sl.get("problems", []) for q in PROTOCOL.get(p, [])
+                if q in YES_NO + ["people"] and q not in asked and sl.get(q) is None and not (q == "people" and sl.get("people"))]
+        if late and call.get("late_asked", 0) < 2:
+            call["late_asked"] = call.get("late_asked", 0) + 1
+            return late[0]
         return "anything_else"
     if units and all(a_.get("arrived") for a_ in units):
         # the crew is there: collect who to call back (if still missing), then hand over
@@ -1257,24 +1263,31 @@ def eta_reply(call: dict) -> str:
     return " ".join(lines)
 
 
-# ======================= CAD backend: how a US 911 centre decides which units to send =======================
-# 1) The call-taker classifies the call and sets a RESPONSE LEVEL from the answers (like the Alpha-to-Echo levels used by US
-#    dispatch protocols). 2) A RUN CARD turns call type + level into a list of units (US practice: a fire engine co-responds to
-#    cardiac arrest, police control traffic at serious fires and crashes, a second engine for a working fire).
-# 3) The dispatcher sends each unit by RADIO. 4) Units report status: dispatched, en route, on scene, transporting, at hospital.
-LEVELS = {   # code -> name, meaning, response mode, colour
-    "E": ("ECHO", "Immediate threat to life", "Lights & sirens, closest units", "#7C3AED"),
-    "D": ("DELTA", "Life-threatening", "Lights & sirens", "#D62839"),
-    "C": ("CHARLIE", "Serious: advanced care may be needed", "Lights & sirens", "#E46A1E"),
-    "B": ("BRAVO", "Urgent, not life-threatening", "Urgent, no sirens", "#D9A21B"),
-    "A": ("ALPHA", "Non-urgent", "Normal traffic", "#86AE3A"),
-    "O": ("OMEGA", "No vehicle needed: helpline call-back", "Call-back", "#8A97A5"),
+# ======================= CAD backend: how India's ERSS-112 handles a call (simplified) =======================
+# ERSS (Emergency Response Support System) works through a state Emergency Response Centre (ERC):
+#  1) the COMMUNICATION OFFICER (call-taker) answers 112 and creates a Call for Service (CFS) with event type and priority;
+#  2) the DISPATCH OFFICER assigns the nearest police Emergency Response Vehicle (ERV, tracked by GPS) and, when needed,
+#     conferences the call to the fire control room (101) and the ambulance service (108) or a helpline (181/1091/1098/1906/1912);
+#  3) each unit reports its status on its mobile data terminal: assigned, en route, reached, then the job is closed with an
+#     Action Taken Report (ATR). Priorities here are a simplified P1-P4 scale, not an official ERSS code list.
+LEVELS = {   # internal code -> priority, meaning, response, colour
+    "E": ("P1 · CRITICAL", "Life at immediate risk", "Nearest units, emergency driving", "#7C3AED"),
+    "D": ("P1 · CRITICAL", "Life-threatening", "Emergency driving", "#D62839"),
+    "C": ("P2 · URGENT", "Serious: help needed fast", "Emergency driving", "#E46A1E"),
+    "B": ("P3 · NORMAL", "Urgent, not life-threatening", "Normal driving, priority", "#D9A21B"),
+    "A": ("P3 · NORMAL", "Non-urgent", "Normal driving", "#86AE3A"),
+    "O": ("P4 · ADVICE", "No vehicle needed: helpline call-back", "Call-back", "#8A97A5"),
+}
+AGENCY = {   # who a department's job is passed to in the ERSS model
+    "Police": "ERV (police)", "Fire & Rescue": "101 Fire control", "Ambulance (EMS)": "108 Ambulance",
+    "Disaster Response": "SDRF / NDRF", "Gas Emergency": "1906 Gas", "Electricity Board": "1912 Power",
+    "Women Helpline": "181 / 1091", "Child Helpline": "1098 Childline",
 }
 LEVEL_ORDER = "OABCDE"
 
 
 MIN_LEVEL = {"fire": "C", "collapse": "D", "road_accident": "C", "gas_leak": "C", "flood": "C", "women_safety": "C", "child": "C",
-             "crime": "B", "electric": "B", "medical": "A"}     # e.g. every building fire gets lights & sirens, as in US practice
+             "crime": "B", "electric": "B", "medical": "A"}     # e.g. every building fire is at least P2
 
 
 def response_level(call: dict) -> str:
@@ -1317,23 +1330,23 @@ def run_card(call: dict, level: str) -> list[dict]:
             if hi >= LEVEL_ORDER.index("D"):
                 add("Fire & Rescue", "second engine: working fire / rescue")
             if hi >= LEVEL_ORDER.index("C") or injured:
-                add("Ambulance (EMS)", "standby for burns and smoke injuries")
+                add("Ambulance (EMS)", "108 on standby for injuries")
             if hi >= LEVEL_ORDER.index("D"):
-                add("Police", "scene and traffic control")
+                add("Police", "ERV: crowd and traffic control")
         elif p == "gas_leak":
             add("Fire & Rescue", "gas leak: ventilate, remove ignition sources")
             add("Gas Emergency", "shut off the gas supply")
             if hi >= LEVEL_ORDER.index("C"):
                 add("Police", "evacuation and cordon")
         elif p == "medical":
-            add("Ambulance (EMS)", "patient care and transport")
+            add("Ambulance (EMS)", "108: patient care and transport")
             if level == "E":
-                add("Fire & Rescue", "first responder: CPR until the ambulance arrives")
+                add("Police", "nearest ERV as first responder until 108 arrives")
             if many and hi >= LEVEL_ORDER.index("D"):
                 add("Ambulance (EMS)", "second ambulance: several patients")
         elif p == "road_accident":
             add("Ambulance (EMS)", "patient care and transport")
-            add("Police", "traffic control and accident report")
+            add("Police", "traffic control and accident report (MLC)")
             if sl.get("trapped") is True:
                 add("Fire & Rescue", "extrication: free trapped people")
             if many:
@@ -1365,7 +1378,7 @@ def run_card(call: dict, level: str) -> list[dict]:
         elif p == "electric":
             add("Electricity Board", "isolate the power line")
             if hi >= LEVEL_ORDER.index("C"):
-                add("Fire & Rescue", "keep the scene safe")
+                add("Police", "ERV: cordon off the area")
             if sl.get("touching_wire") is True or injured:
                 add("Ambulance (EMS)", "electric shock patient")
     if not card and sl.get("location"):
@@ -1377,8 +1390,14 @@ def radio(call: dict, a_: dict, level: str) -> None:
     """The dispatcher's radio call to a unit (kept as the radio log)."""
     lv = LEVELS[level]
     probs = ", ".join(PROBLEMS[p]["label"].lower() for p in call["slots"].get("problems", [])) or "check the caller"
-    txt = (f"{a_['unit']}, respond {lv[2].lower()} to {call['slots'].get('location')}: {probs}, level {lv[0]}. {a_['why'].capitalize()}."
-           if a_.get("unit") else f"{a_['dept']}: ticket {a_.get('ticket') or ''}, {a_['why']}.")
+    agency = AGENCY.get(a_["dept"], a_["dept"])
+    if a_.get("unit") and a_["dept"] == "Police":
+        txt = f"CFS {call['ref']} assigned to {a_['unit']} ({agency}): {probs} at {call['slots'].get('location')}, {lv[0]}. {a_['why'].capitalize()}."
+    elif a_.get("unit"):
+        txt = (f"Call conferenced to {agency}: {a_['unit']} assigned to {call['slots'].get('location')}, {probs}, {lv[0]}. "
+               f"{a_['why'].capitalize()}.")
+    else:
+        txt = f"Passed to {agency}: ticket {a_.get('ticket') or ''}, {a_['why']}."
     call.setdefault("radio", []).append((time.time(), a_["icon"], txt))
 
 
@@ -1453,8 +1472,26 @@ def check_arrivals(call: dict) -> bool:
     for a_ in units:
         if a_.get("arrived") and not a_.get("arrived_at"):
             a_["arrived_at"] = now
-        if a_["dept"] == "Ambulance (EMS)" and a_.get("arrived_at") and call["slots"].get("location") != hospital:
-            on_scene_min = (now - a_["arrived_at"]) / a_.get("speed", sim_seconds)
+        sl_ = call["slots"]
+        has_patient = (sl_.get("breathing") is False or sl_.get("bleeding") is True or sl_.get("trapped") is True
+                       or "medical" in sl_.get("problems", []) or sl_.get("touching_wire") is True
+                       or bool(sl_.get("people") and sl_.get("people_src") == "caller"))
+        on_scene_min = (now - a_["arrived_at"]) / a_.get("speed", sim_seconds) if a_.get("arrived_at") else 0
+        if (a_["dept"] == "Ambulance (EMS)" and a_.get("arrived_at") and not has_patient and not a_.get("released")
+                and a_.get("contact") and on_scene_min >= 6 and sl_.get("bleeding") is not True
+                and all(u.get("arrived") for u in units if u is not a_ and u["dept"] != "Ambulance (EMS)")):
+            # standby ambulance with nobody to treat: released back to service (never "transporting" an empty stretcher)
+            a_["released"] = True
+            st.session_state.used_vehicle_ids.discard(a_["unit"])
+            add_event(call, a_["icon"], f"{a_['unit']} released: no patient needed transport")
+            call.setdefault("radio", []).append((now, a_["icon"], f"{a_['unit']}: no patient at scene, back in service."))
+            changed = True
+        if a_["dept"] != "Ambulance (EMS)" and a_.get("contact") and not a_.get("atr") and on_scene_min >= 10:
+            a_["atr"] = True                                   # the job is closed with an Action Taken Report
+            add_event(call, "📝", f"{a_['unit']}: job closed, Action Taken Report (ATR) submitted")
+            call.setdefault("radio", []).append((now, "📝", f"{a_['unit']}: CFS {call['ref']} closed, ATR submitted."))
+            changed = True
+        if a_["dept"] == "Ambulance (EMS)" and has_patient and a_.get("arrived_at") and call["slots"].get("location") != hospital:
             if a_.get("contact") and not a_.get("transport_at") and on_scene_min >= 4:
                 try:
                     a_["transport_eta"] = max(1.0, route_minutes(make_city_graph(), LANDMARKS[call["slots"]["location"]], LANDMARKS[hospital]))
@@ -1462,6 +1499,10 @@ def check_arrivals(call: dict) -> bool:
                     a_["transport_eta"] = 6.0
                 a_["transport_at"] = now
                 add_event(call, "🏥", f"{a_['unit']} transporting the patient to {hospital}")
+                if not call["ended"]:                          # keep the caller in the loop
+                    agent_say(call, (f"{a_['unit']} मरीज़ को {hospital} ले जा रही है, लगभग {a_['transport_eta']:.0f} मिनट।"
+                                     if call["hindi"] else
+                                     f"{a_['unit']} is taking the patient to {hospital}, about {a_['transport_eta']:.0f} minutes away."))
                 call.setdefault("radio", []).append((now, a_["icon"], f"{a_['unit']}: transporting one patient to {hospital}, "
                                                                      f"about {a_['transport_eta']:.0f} minutes."))
                 changed = True
@@ -1470,7 +1511,10 @@ def check_arrivals(call: dict) -> bool:
                 add_event(call, "🏥", f"{a_['unit']} at {hospital}: patient handed to the hospital")
                 call.setdefault("radio", []).append((now, a_["icon"], f"{a_['unit']}: at {hospital}, patient handed over."))
                 changed = True
-    all_there = bool(units) and all(a_.get("arrived") for a_ in units)
+    all_there = bool(units) and all(a_.get("arrived") or a_.get("released") for a_ in units)
+    if call.get("handover_when_all") and all_there and not call["ended"]:
+        hand_over(call, "Last unit reached the scene: call handed over")
+        return True
     if c["arrival"] != "crew" and all_there and not call["ended"] and not call.get("handover_asked"):
         call["handover_asked"] = now
         add_event(call, "📣", "All teams on scene")
@@ -1545,6 +1589,17 @@ def caller_says(call: dict, text: str) -> dict:
     if call.get("pending") == "anything_else":
         low = " " + re.sub(r"[^\w\u0900-\u097F' ]", " ", text.lower()) + " "
         if any(f" {w} " in low for w in DONE_WORDS) and not rule_problems(text):
+            coming = [a_ for a_ in call["assignments"] if a_.get("unit") and not a_.get("arrived") and not a_.get("released")]
+            if coming:
+                # some units are still on the way: stay on the line until they arrive, then hand over
+                nxt = min(coming, key=unit_left)
+                call["handover_when_all"], call["pending"] = True, None
+                agent_say(call, (f"ठीक है। {nxt['dept']} की {nxt['unit']} अभी लगभग {max(1, math.ceil(unit_left(nxt)))} मिनट दूर है। "
+                                 "उनके पहुँचने तक मैं लाइन पर हूँ।") if hindi else
+                          (f"Okay. {nxt['unit']} from {nxt['dept']} is still about {max(1, math.ceil(unit_left(nxt)))} minutes away. "
+                           "I will stay on the line until they reach you."))
+                add_event(call, "⏳", "Caller needs nothing more: waiting for " + ", ".join(a_["unit"] for a_ in coming))
+                return {"reply": call["turns"][-1]["text"], "understood": ["done_waiting"], "severity": call["severity"]}
             hand_over(call, "Caller needed nothing more: call handed over to the crew")
             return {"reply": call["turns"][-1]["text"], "understood": ["done"], "severity": call["severity"]}
         call["pending"] = None                       # new information: handle it as a normal turn, then ask again
@@ -1694,6 +1749,7 @@ CARD_CSS = """
 .fl{opacity:.7}.fv{font-weight:650}.fs{font-size:.72rem;opacity:.55;text-align:right}
 .sys{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:12px;padding-top:10px;border-top:1px dashed rgba(128,128,128,.3);
   font-size:.76rem;opacity:.8}
+.erss{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:.76rem;opacity:.8;margin:2px 0 10px}
 .cad{list-style:none;margin:6px 0 0;padding:0}.cad li{display:grid;grid-template-columns:24px 1fr auto;gap:6px;font-size:.86rem;
   padding:5px 0;border-top:1px solid rgba(128,128,128,.18)}.cad li:first-child{border-top:0}
 </style>
@@ -1778,7 +1834,8 @@ def incident_card_html(c_: dict) -> str:
             left = unit_left(a_, now)
             frac = 1 - left / a_["eta"] if a_["eta"] else 1
             stage = 3 if a_.get("contact") else 2 if left <= 0 else 1 if frac > 0.03 else 0
-            eta = ("🏥 at hospital" if a_.get("at_hospital") else "🚑 transporting" if a_.get("transport_at") else
+            eta = ("↩️ released" if a_.get("released") else "📝 ATR closed" if a_.get("atr") else
+                   "🏥 at hospital" if a_.get("at_hospital") else "🚑 transporting" if a_.get("transport_at") else
                    "🤝 with caller" if a_.get("contact") else "✅ on scene" if left <= 0 else f"{max(1, math.ceil(left))} min")
             html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b>{' <span class=chip>lead</span>' if a_.get('role') == 'lead' else ''}"
                         f" <span style='opacity:.7'>{a_['unit']}</span><span class='eta'>{eta}</span></div>"
@@ -1796,17 +1853,24 @@ def incident_card_html(c_: dict) -> str:
         rows = []
         for cd in c_.get("run_card", []):
             a_ = next((x for x in c_["assignments"] if x["dept"] == cd["dept"] and x["why"] == cd["why"]), None)
-            what = (a_.get("unit") or a_.get("ticket") or a_["status"]) if a_ else "pending"
+            what = ((a_.get("unit") or a_.get("ticket") or a_["status"])
+                    + (" · released" if a_.get("released") else " · ATR" if a_.get("atr") else " · at hospital" if a_.get("at_hospital")
+                       else " · transporting" if a_.get("transport_at") else " · reached" if a_.get("arrived") else " · en route"
+                       if a_.get("unit") else "")) if a_ else "pending"
             rows.append(f"<li><span>{DEPARTMENTS[cd['dept']]['icon']}</span><span><b>{cd['dept']}</b> · {cd['why']}</span>"
                         f"<span style='opacity:.75'>{what}</span></li>")
-        radio_rows = "".join(f"<li><time>{time.strftime('%H:%M:%S', time.localtime(t_))}</time><span>📻</span><span>{tx}</span></li>"
-                             for t_, ic, tx in c_.get("radio", [])[-5:])
-        html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🧠</span><div><b>CAD decision</b><br>"
-                    "<span class='ref'>How the backend chose the units (911-style run card)</span></div></div>"
+        radio_rows = "".join(f"<li><time>{time.strftime('%H:%M:%S', time.localtime(t_))}</time><span>{ic}</span><span>{tx}</span></li>"
+                             for t_, ic, tx in c_.get("radio", [])[-6:])
+        etype = ", ".join(PROBLEMS[p]["label"] for p in c_["slots"].get("problems", [])) or "Unclear (police check)"
+        agencies = " · ".join(dict.fromkeys(AGENCY.get(a_["dept"], a_["dept"]) for a_ in c_["assignments"]))
+        html.append("<div class='ic'><div class='ic-h'><span style='font-size:1.3rem'>🧠</span><div><b>ERSS-112 CAD decision</b><br>"
+                    f"<span class='ref'>Call for Service {c_['ref']} · event type: {etype}</span></div></div>"
+                    "<div class='erss'><span>📞 Communication Officer: CFS created</span><span>🗺️ Dispatch Officer: nearest units by GPS</span>"
+                    f"<span>🔀 Agencies: {agencies or '…'}</span></div>"
                     f"<div class='sev'><span class='n' style='background:{lv[3]};font-size:1.05rem;padding:0 10px'>{lv[0]}</span>"
                     f"<div><div style='font-weight:650'>{lv[1]}</div><div class='lbl'>Response: {lv[2]}</div></div></div>"
                     "<ul class='cad'>" + "".join(rows) + "</ul>"
-                    + (f"<div class='k' style='font-size:.74rem;text-transform:uppercase;opacity:.6;margin-top:10px'>📻 Dispatch radio</div>"
+                    + (f"<div class='k' style='font-size:.74rem;text-transform:uppercase;opacity:.6;margin-top:10px'>📟 ERV / agency messages</div>"
                        f"<ul class='tl'>{radio_rows}</ul>" if radio_rows else "") + "</div>")
     # timeline
     ev = c_.get("events", [])
@@ -2665,7 +2729,7 @@ with tab_dept:
                 if not mine:
                     st.caption("No jobs yet.")
 
-    with st.expander("🇮🇳 India 112 and 🇺🇸 USA 911: the same idea"):
+    with st.expander("🇮🇳 How ERSS-112 works (and how it compares with 🇺🇸 911)"):
         st.markdown("""
 | Step | India (112 ERSS) | USA (911) | In this app |
 |---|---|---|---|
