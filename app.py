@@ -1013,6 +1013,9 @@ def call_triage(call: dict) -> dict:
 
 def next_question(call: dict) -> str | None:
     sl, asked = call["slots"], call["asked"]
+    units = [a_ for a_ in call.get("assignments", []) if a_.get("unit")]
+    if units and all(a_.get("arrived") for a_ in units):
+        return "handover_confirm"                     # the crew is there: only the hand-over is left
     if not sl.get("problems"):
         return "problem_again" if "problem_again" not in asked and call["turns"] and any(t_["role"] == "caller" for t_ in call["turns"]) else (
             None if "problem_again" in asked else "problem")
@@ -1029,7 +1032,16 @@ def next_question(call: dict) -> str | None:
 
 ETA_WORDS = ["how long", "how much time", "when will", "where is the", "eta", "are they coming", "kitni der", "kab aayega",
              "kab ayega", "kab aayegi", "कितनी देर", "कब आएगी", "कब आएगा", "कब तक", "कहाँ है", "कहां है"]
+HANDOVER_WAIT = 45          # seconds to wait for the caller's confirmation before closing the call
+SEE_TEAM_WORDS = ["they are here", "they're here", "with me", "i can see", "arrived", "reached", "aa gaye", "aa gayi", "pahunch",
+                  "आ गए", "आ गई", "आ गयी", "पहुँच", "पहुंच", "दिख रहे", "दिख रही"]
 SAY.update({
+    "handover_q": ("All teams have reached {place}. Can you see them? Say yes when they are with you.",
+                   "सभी टीमें {place} पहुँच गई हैं। क्या आप उन्हें देख पा रहे हैं? जब वे आपके पास हों तो हाँ बोलिए।"),
+    "not_found": ("Stay where you are and keep your phone on. I have told the team to look for you near {place}. "
+                  "Tell me when you can see them.",
+                  "जहाँ हैं वहीं रहिए और फ़ोन चालू रखिए। मैंने टीम को {place} के पास आपको ढूँढने के लिए कहा है। जब वे दिखें तो बताइए।"),
+    "yes_no_again": ("Please answer yes or no:", "कृपया हाँ या नहीं में बताइए:"),
     "eta_one": ("{unit} ({dept}) is about {mins} minutes away.", "{unit} ({dept}) लगभग {mins} मिनट दूर है।"),
     "eta_here": ("{unit} ({dept}) has already reached you.", "{unit} ({dept}) आपके पास पहुँच चुकी है।"),
     "eta_none": ("Help is being arranged; I will tell you as soon as a unit is on its way.",
@@ -1070,12 +1082,27 @@ def check_arrivals(call: dict) -> bool:
             if not call["ended"]:
                 agent_say(call, _l(SAY["arrived"], call["hindi"]).format(
                     icon=a_["icon"], unit=a_["unit"], dept=a_["dept"], place=call["slots"].get("location") or "you"))
-    if units and all(a_.get("arrived") for a_ in units) and not call["ended"]:
+    all_there = bool(units) and all(a_.get("arrived") for a_ in units)
+    if all_there and not call["ended"] and not call.get("handover_asked"):
+        # like a real call-taker: stay on the line until the caller confirms the crew is with them
+        call["handover_asked"], call["pending"] = now, "handover_confirm"
+        agent_say(call, _l(SAY["handover_q"], call["hindi"]).format(place=call["slots"].get("location") or "you"))
+        add_event(call, "📣", "All teams on scene: asking the caller to confirm contact")
+        changed = True
+    elif all_there and not call["ended"] and call.get("handover_asked") and now - call["handover_asked"] > HANDOVER_WAIT \
+            and call["turns"][-1]["role"] == "agent":
+        # no answer for a while: the crew is on scene, so close the call politely
         agent_say(call, _l(SAY["handover"], call["hindi"]).format(ref=call["ref"]))
-        call["ended"], call["ended_by"], call["ended_at"] = True, "handover", time.time()
-        add_event(call, "🤝", "All teams on scene: call handed over")
+        call["ended"], call["ended_by"], call["ended_at"] = True, "handover", now
+        add_event(call, "🤝", "No reply after the teams arrived: call handed over")
         changed = True
     return changed
+
+
+def hand_over(call: dict) -> None:
+    agent_say(call, _l(SAY["handover"], call["hindi"]).format(ref=call["ref"]))
+    call["ended"], call["ended_by"], call["ended_at"], call["pending"] = True, "handover", time.time(), None
+    add_event(call, "🤝", "Caller confirmed the crew is with them: call handed over")
 
 
 @traceable(run_type="chain", name="Call-taker turn",
@@ -1085,6 +1112,18 @@ def caller_says(call: dict, text: str) -> dict:
     """One turn of the conversation: understand, dispatch or update, instruct, ask the next question."""
     hindi = call["hindi"]
     call["turns"].append({"role": "caller", "text": text.strip(), "t": time.strftime("%H:%M:%S")})
+    if call.get("pending") == "handover_confirm":
+        low = text.lower()
+        yn = yes_no(text)                            # check "no" first: "नहीं दिख रहे" is a no, not a yes
+        if yn is not False and (yn is True or any(w in low for w in SEE_TEAM_WORDS)):
+            hand_over(call)
+            return {"reply": call["turns"][-1]["text"], "understood": ["team_contact"], "severity": call["severity"]}
+        if yn is False:
+            agent_say(call, _l(SAY["not_found"], hindi).format(place=call["slots"].get("location") or "you"))
+            add_event(call, "🔦", "Caller cannot see the team: crew told to search nearby")
+            call["handover_asked"] = time.time()
+            return {"reply": call["turns"][-1]["text"], "understood": ["team_not_found"], "severity": call["severity"]}
+        call["pending"] = None                       # something else: handle it as a normal turn below
     if any(w in text.lower() for w in ETA_WORDS) and call["dispatched"]:
         # "how long will they take?": answer from the live position of the units, then repeat the open question
         reply = eta_reply(call)
@@ -1095,8 +1134,9 @@ def caller_says(call: dict, text: str) -> dict:
     got = extract_into(call, text)
     sl = call["slots"]
     parts = []
-    if not got and call.get("pending") not in ("description", "child_desc", "name"):
-        call["misses"][call.get("pending")] = call["misses"].get(call.get("pending"), 0) + 1
+    pend0 = call.get("pending")
+    if (pend0 in YES_NO and pend0 not in got) or (not got and pend0 not in ("description", "child_desc", "name")):
+        call["misses"][pend0] = call["misses"].get(pend0, 0) + 1
     if "problems" in got:
         add_event(call, "🔎", "Problem: " + ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])))
     if "location" in got:
@@ -1166,7 +1206,18 @@ def caller_says(call: dict, text: str) -> dict:
         if on and key not in call["said_instructions"]:
             call["said_instructions"].append(key)
             parts.append(_l(INSTRUCT[key], hindi))
+    pend = call.get("pending")
+    if pend in YES_NO and pend not in got and call["misses"].get(pend, 0) == 1 and not (set(got) & {"problems", "location"}):
+        # the answer did not say yes or no: ask the same question once more, plainly
+        call["misses"][pend] += 1
+        agent_say(call, " ".join(p for p in parts if p) + " " + _l(SAY["yes_no_again"], hindi) + " " + _l(CALL_Q[pend], hindi))
+        return {"reply": call["turns"][-1]["text"], "understood": got, "severity": call["severity"], "reasked": pend}
     q = next_question(call)
+    if q == "handover_confirm":
+        call["handover_asked"], call["pending"] = time.time(), "handover_confirm"
+        parts.append(_l(SAY["handover_q"], hindi).format(place=sl.get("location") or "you"))
+        agent_say(call, " ".join(p for p in parts if p))
+        return {"reply": call["turns"][-1]["text"], "understood": got, "severity": call["severity"]}
     if q is None and not got and not call["dispatched"]:
         parts.append(_l(SAY["not_heard"], hindi))
         q = call.get("pending")
