@@ -648,7 +648,7 @@ PROBLEMS = {      # the ONLY problem categories the router may choose; each one 
     "gas_leak":      {"label": "Gas leak", "kw": ["gas leak", "gas smell", "smell of gas", "cylinder", "lpg"], "teams": ["Fire & Rescue", "Gas Emergency"]},
     "medical":       {"label": "Medical emergency", "kw": ["unconscious", "not breathing", "heart attack", "chest pain", "fainted", "seizure",
                                                           "stroke", "bleeding", "injured", "hurt", "labour pain", "snake bite", "poison",
-                                                          "overdose", "behosh", "fell", "not moving", "collapsed", "burns"],
+                                                          "overdose", "behosh", "fell", "not moving", "collapsed", "burns", "faint"],
                       "teams": ["Ambulance (EMS)"]},
     "road_accident": {"label": "Road accident", "kw": ["accident", "crash", "collided", "collision", "hit by", "overturned", "run over",
                                                        "skidded"], "teams": ["Ambulance (EMS)", "Police"]},
@@ -660,7 +660,7 @@ PROBLEMS = {      # the ONLY problem categories the router may choose; each one 
                       "teams": ["Disaster Response"]},
     "crime":         {"label": "Crime / violence", "kw": ["robbery", "robbed", "robbing", "theft", "stolen", "thief", "burglary", "break in", "broke into",
                                                           "snatch", "gun", "pistol", "knife", "knives", "shot", "shooting", "stabbed", "fight",
-                                                          "beating", "attack", "assault", "threat", "kidnap", "murder", "chor", "loot"],
+                                                          "beating", "beaten", "beat up", "attack", "assault", "threat", "murder", "chor", "loot"],
                       "teams": ["Police"]},
     "women_safety":  {"label": "Women safety", "kw": ["harass", "stalking", "stalker", "molest", "eve teasing", "domestic violence",
                                                       "husband beat", "beats me", "dowry", "women safety", "woman being", "girl being"],
@@ -671,7 +671,25 @@ PROBLEMS = {      # the ONLY problem categories the router may choose; each one 
     "electric":      {"label": "Electric hazard", "kw": ["live wire", "electric wire", "wire fallen", "wire has fallen", "power line",
                                                          "transformer", "electric shock", "electrocuted", "sparking", "current laga"],
                       "teams": ["Electricity Board"]},
+    "trafficking":   {"label": "Trafficking", "kw": ["traffick", "being sold", "selling children", "selling girls", "forced labour",
+                                                     "forced labor", "bonded labour", "bonded labor", "taskari", "तस्करी", "बेचा जा रहा",
+                                                     "बेची जा रही", "बंधुआ"], "teams": ["Police"]},
+    "kidnapping":    {"label": "Kidnapping / abduction", "kw": ["kidnap", "abduct", "forced into a car", "pulled into a van", "pulled into a car", "into a van", "into the van", "into a car", "into the car",
+                                                                "taken away by force", "utha le gaye", "utha liya", "agwa", "अपहरण", "उठा ले गए",
+                                                                "उठा लिया"], "teams": ["Police"]},
+    "missing_person": {"label": "Missing person", "kw": ["missing", "not come home", "not returned home", "has not returned", "can't find",
+                                                        "cannot find", "laapata", "lapata", "gayab", "लापता", "गायब", "नहीं मिल रहा",
+                                                        "नहीं मिल रही"], "teams": ["Police"]},
+    "sexual_violence": {"label": "Sexual violence", "kw": ["rape", "raped", "sexual assault", "sexually assault", "sexual abuse", "balatkar",
+                                                          "बलात्कार", "यौन"], "teams": ["Police", "Women Helpline", "Ambulance (EMS)"]},
+    "suspicious":    {"label": "Suspicious activity / public threat", "kw": ["suspicious", "unattended bag", "abandoned bag", "bomb",
+                                                                            "explosive", "shots fired", "gunshot", "firing", "riot", "mob",
+                                                                            "stampede", "terror", "sandigdh", "laawaris", "लावारिस",
+                                                                            "संदिग्ध", "बम", "दंगा", "भगदड़"], "teams": ["Police"]},
+    "other":         {"label": "Other / Unclassified emergency", "kw": [], "teams": ["Police"]},
 }
+SUBSUMES = {"child": ["missing_person"], "kidnapping": ["crime"], "trafficking": ["crime", "missing_person"],
+            "sexual_violence": ["crime", "women_safety"]}       # a more specific type replaces a general one
 HINDI_PROBLEM_WORDS = {   # Devanagari words, as the browser writes Hindi speech
     "fire": ["आग", "धुआं", "धुआँ", "जल रहा", "जल रही"], "gas_leak": ["गैस", "सिलेंडर"],
     "medical": ["बेहोश", "सांस", "साँस", "खून", "घायल", "चोट", "दिल का दौरा", "गिर गए", "गिर गया"],
@@ -697,7 +715,9 @@ def rule_problems(text: str) -> list[tuple[str, str]]:
         hit = next((k for k in p["kw"] if k in t), None)
         if hit:
             found.append((pid, hit))
-    return found
+    ids = {pid for pid, _ in found}
+    drop = {d for pid in ids for d in SUBSUMES.get(pid, [])}
+    return [(pid, hit) for pid, hit in found if pid not in drop]
 
 
 @st.cache_data(show_spinner=False, max_entries=500, ttl=3600)
@@ -893,9 +913,8 @@ digraph G {
 CALL_Q = {   # slot -> (English, Hindi)
     "problem": ("112, what is the location of your emergency? Then tell me exactly what happened.",
                 "112, आपकी आपात स्थिति की जगह क्या है? फिर ठीक-ठीक बताइए क्या हुआ।"),
-    "problem_again": ("I need to understand what happened. Is it a fire, an accident, someone ill or hurt, a crime, a building collapse, "
-                      "a flood, a gas leak or a fallen electric wire?",
-                      "मुझे समझना है क्या हुआ। आग, दुर्घटना, कोई बीमार या घायल, अपराध, इमारत गिरना, बाढ़, गैस लीक या बिजली का तार?"),
+    "problem_again": ("Please tell me in your own words what is happening. Is anyone hurt or in danger right now?",
+                      "कृपया अपने शब्दों में बताइए क्या हो रहा है। क्या अभी कोई घायल है या खतरे में है?"),
     "location": ("Where are you? Tell me the nearest landmark, like a hospital, station, market, temple or mall.",
                  "आप कहाँ हैं? पास की कोई जगह बताइए, जैसे अस्पताल, स्टेशन, बाज़ार, मंदिर या मॉल।"),
     "location_again": ("I could not find that place. Which landmark is closest? You can also pick it from the list.",
@@ -920,14 +939,17 @@ PROTOCOL = {   # problem -> the questions a call-taker asks next, in order
     "collapse": ["trapped", "breathing", "people"], "flood": ["trapped", "people"], "fire": ["spreading", "trapped", "people"],
     "gas_leak": ["caller_safe", "people"], "crime": ["caller_safe", "weapon", "description", "people"],
     "women_safety": ["caller_safe", "weapon", "description"], "child": ["child_desc", "description"], "electric": ["touching_wire", "people"],
+    "trafficking": ["caller_safe", "description", "people"], "kidnapping": ["description", "people"],
+    "missing_person": ["description", "people"], "sexual_violence": ["caller_safe", "bleeding", "description"],
+    "suspicious": ["caller_safe", "description"], "other": ["caller_safe", "people"],
 }
 YES_NO = ["breathing", "bleeding", "trapped", "spreading", "caller_safe", "weapon", "touching_wire"]
 YES_WORDS = ["yes", "yeah", "yep", "haan", "han", "haa", "ji", "sure", "correct", "right", "हाँ", "हां", "जी", "हा"]
 NO_WORDS = ["no", "nope", "nahi", "nahin", "not", "isn't", "isnt", "doesn't", "can't", "नहीं", "नही", "ना"]
 UNSURE = ["don't know", "dont know", "not sure", "no idea", "pata nahi", "पता नहीं", "मालूम नहीं"]
 SAY = {   # fixed phrases (English, Hindi)
-    "sending": ("I am sending {teams} now. {unit} is about {eta} minutes away. Stay on the line.",
-                "मैं अभी {teams} भेज रहा हूँ। {unit} लगभग {eta} मिनट में पहुँचेगी। लाइन पर बने रहिए।"),
+    "sending": ("Dispatch confirmed: {teams}. {unit} is about {eta} minutes away. Stay on the line.",
+                "डिस्पैच की पुष्टि हो गई: {teams}। {unit} लगभग {eta} मिनट में पहुँचेगी। लाइन पर बने रहिए।"),
     "extra": ("I have also alerted {teams}.", "मैंने {teams} को भी सूचित कर दिया है।"),
     "upgraded": ("This is now marked life-threatening and the team has been told.", "इसे अब जानलेवा माना गया है और टीम को बता दिया गया है।"),
     "queued": ("All suitable units are busy; you are first in the queue.", "सभी गाड़ियाँ व्यस्त हैं; आप कतार में सबसे आगे हैं।"),
@@ -954,9 +976,12 @@ INSTRUCT = {   # life-saving instructions triggered by an answer (English, Hindi
 }
 PROBLEM_HI = {"fire": "आग", "gas_leak": "गैस लीक", "medical": "मेडिकल इमरजेंसी", "road_accident": "सड़क दुर्घटना",
               "collapse": "इमारत गिरना", "flood": "बाढ़", "crime": "अपराध", "women_safety": "महिला सुरक्षा",
-              "child": "बच्चा खतरे में", "electric": "बिजली का खतरा"}
+              "child": "बच्चा खतरे में", "electric": "बिजली का खतरा", "trafficking": "तस्करी", "kidnapping": "अपहरण",
+              "missing_person": "लापता व्यक्ति", "sexual_violence": "यौन हिंसा", "suspicious": "संदिग्ध गतिविधि / खतरा",
+              "other": "अन्य आपात स्थिति"}
 TYPE_OF = {"fire": "Fire", "gas_leak": "Fire", "collapse": "Rescue", "flood": "Rescue", "electric": "Rescue", "medical": "Medical",
-           "road_accident": "Medical", "crime": "Police", "women_safety": "Police", "child": "Police"}
+           "road_accident": "Medical", "crime": "Police", "women_safety": "Police", "child": "Police", "trafficking": "Police",
+           "kidnapping": "Police", "missing_person": "Police", "sexual_violence": "Police", "suspicious": "Police", "other": "Police"}
 
 
 def _l(pair: tuple[str, str], hindi: bool) -> str:
@@ -1022,6 +1047,8 @@ def extract_location_text(text: str, pending: str | None = None) -> str | None:
         t2 = ", ".join(parts)
         words = re.sub(r"^(?:it is|it's|i am|i'm|we are|the location is|my location is|location|address|पता|जगह)\s+", "", t2, flags=re.I)
         words = words.strip(" .,!?").split()
+        if any(w.lower().strip(",.") in LOC_STOP for w in words):
+            return None                                   # "a strange smell and people are coughing" is not a place
         if 1 <= len(words) <= 10:
             return tidy(words)
     return None
@@ -1070,7 +1097,17 @@ def question_text(call: dict, q: str) -> str:
                 f"My screen shows your number as {num}. Can the team call you back on this number?")
     if q == "phone" and "phone" in call["asked"]:
         return "किस नंबर पर टीम आपको कॉल करे?" if hindi else "Which number should the team call you on?"
+    if q == "location_pick":
+        opts = "; ".join(f"{k + 1}: {o['name'][:70]}" for k, o in enumerate(sl.get("geo_options", [])))
+        return (f"मुझे नक्शे पर कुछ जगहें मिलीं: {opts}। कौन सी सही है? नंबर बताइए।" if hindi else
+                f"I found a few places on the map: {opts}. Which one is it? Say the number.")
+    if q == "location_landmark":
+        return (f"मुझे “{sl.get('location')}” नक्शे पर नहीं मिला। पास की कोई जानी-पहचानी जगह, मोहल्ला, ज़िला या राज्य बताइए।" if hindi else
+                f"I could not find “{sl.get('location')}” on the map. Please tell me a nearby landmark, locality, district or state.")
     if q == "location_confirm":
+        if sl.get("geo_state") == "one" and sl.get("geo"):
+            return (f"मुझे नक्शे पर “{sl['geo']['name'][:90]}” मिला। क्या आपात स्थिति यहीं है?" if hindi else
+                    f"I found “{sl['geo']['name'][:90]}” on the map. Is that where the emergency is?")
         return (f"मैंने जगह “{sl.get('location')}” लिखी है। क्या यह सही है?" if hindi else
                 f"I have the location as “{sl.get('location')}”. Is that correct?")
     if q == "location" and call.get("loc_rejected"):
@@ -1109,6 +1146,140 @@ def crew_say(call: dict, a_: dict, text: str) -> None:
     """A crew member speaks in the call (three-way call: caller, call-taker, crew)."""
     call["turns"].append({"role": "crew", "who": f"{a_['icon']} {a_['unit']} crew", "text": text, "t": ist_time()})
     call["last_prompt_at"] = time.time()
+
+
+SUSPECT_WORDS = ["i think", "i suspect", "suspect", "maybe", "might be", "may be", "seems", "looks like", "probably", "not sure",
+                 "i doubt", "lagta hai", "shayad", "shak", "शायद", "लगता है", "शक"]
+HYPO_WORDS = ["what if", "suppose", "for example", "hypothetically", "agar koi", "अगर कोई", "मान लो"]
+PAST_WORDS = ["yesterday", "last night", "last week", "last month", "days ago", "weeks ago", "years ago", "kal raat", "pichhle", "कल रात",
+              "पिछले", "साल पहले", "दिन पहले"]
+NOW_WORDS = ["now", "right now", "happening", "is being", "are being", "currently", "abhi", "अभी", "हो रहा", "हो रही"]
+CHILD_WORDS = ["child", "children", "kid", "kids", "boy", "girl", "baby", "son", "daughter", "minor", "bachcha", "bachchi", "bacche",
+               "bachchon", "बच्च", "लड़का", "लड़की"]
+WOMAN_WORDS = ["woman", "women", "lady", "wife", "girl", "mahila", "aurat", "महिला", "औरत", "लड़की"]
+
+
+def understand(text: str) -> dict:
+    """Interpret the caller's own sentence (the transcript itself is never changed): is it a report, a suspicion,
+    a question or a hypothetical; is it happening now; who is at risk."""
+    t = " " + text.lower() + " "
+    question = text.strip().endswith("?") and bool(re.match(r"\s*(what|how|can|could|where|who|when|is it|should|kya|क्या|कैसे)\b",
+                                                           text.strip().lower()))
+    hypo = any(w in t for w in HYPO_WORDS)
+    suspected = any(w in t for w in SUSPECT_WORDS)
+    past = any(w in t for w in PAST_WORDS) and not any(w in t for w in NOW_WORDS)
+    subject = ("child" if any(re.search(r"\b" + re.escape(w) + r"\b", t) for w in CHILD_WORDS if w.isascii())
+               or any(w in t for w in CHILD_WORDS if not w.isascii()) else
+               "woman" if any(re.search(r"\b" + re.escape(w) + r"\b", t) for w in WOMAN_WORDS if w.isascii())
+               or any(w in t for w in WOMAN_WORDS if not w.isascii()) else None)
+    kind = "hypothetical" if hypo else "question" if question else "suspected" if suspected else "reported"
+    return {"certainty": kind, "time": "past" if past else "now or unknown", "subject": subject}
+
+
+@st.cache_data(show_spinner=False, max_entries=500, ttl=3600)
+def llm_classify(text: str, api_key: str, model: str) -> dict:
+    """Optional AI reading of the whole sentence. Free-text label, but the operational category must come from the list."""
+    cats = ", ".join(PROBLEMS)
+    prompt = ("Classify this emergency call. Reply with a JSON object only, with these keys: "
+              "label (a short descriptive incident label in English), "
+              f"category (exactly one of: {cats}), certainty (one of: reported, suspected, question, hypothetical), "
+              "time (one of: now, past, unknown), subject (one of: child, woman, person, none), immediate_danger (true or false). "
+              "Never invent details. Text: " + repr(text))
+    try:
+        r = Groq(api_key=api_key).chat.completions.create(model=model, temperature=0, max_completion_tokens=200,
+                                                          response_format={"type": "json_object"},
+                                                          messages=[{"role": "user", "content": prompt}])
+        d = parse_json_response(r.choices[0].message.content or "")
+        out = {"label": str(d.get("label") or "")[:80]}
+        out["category"] = d.get("category") if d.get("category") in PROBLEMS else None
+        out["certainty"] = d.get("certainty") if d.get("certainty") in ("reported", "suspected", "question", "hypothetical") else None
+        out["subject"] = d.get("subject") if d.get("subject") in ("child", "woman") else None
+        out["immediate_danger"] = bool(d.get("immediate_danger"))
+        return out
+    except Exception:
+        return {}
+
+
+def incident_label(call: dict) -> str:
+    """A descriptive label in plain words, e.g. "Suspected child trafficking". Never states an allegation as proven."""
+    sl = call["slots"]
+    probs = sl.get("problems", [])
+    if call.get("ai_label") and probs:
+        base = call["ai_label"]
+    elif probs:
+        base = PROBLEMS[probs[0]]["label"]
+        if call.get("subject") == "child" and probs[0] in ("trafficking", "kidnapping", "sexual_violence"):
+            base = "Child " + base.lower()
+    else:
+        return "Not yet clear"
+    if (call.get("certainty") == "suspected" or probs[0] == "trafficking") and not base.lower().startswith("suspected"):
+        base = "Suspected " + base[0].lower() + base[1:]
+    elif probs[0] in ("kidnapping", "sexual_violence", "crime") and not base.lower().startswith(("reported", "suspected")):
+        base = "Reported " + base[0].lower() + base[1:]
+    if call.get("certainty") in ("question", "hypothetical"):
+        base += " (" + call["certainty"] + ")"
+    if call.get("time") == "past":
+        base += " (reported as past)"
+    return base
+
+
+def escalation_reasons(call: dict) -> list[str]:
+    """When an authorised human dispatcher must be alerted (AI classification is never proof)."""
+    sl, probs, r = call["slots"], call["slots"].get("problems", []), []
+    if set(probs) & {"trafficking", "kidnapping", "sexual_violence"} or (call.get("subject") == "child" and probs):
+        r.append("safeguarding: child or serious-harm report")
+    if "other" in probs:
+        r.append("unclassified emergency")
+    if call.get("certainty") == "suspected":
+        r.append("suspected, not confirmed")
+    if sl.get("location") and sl.get("geo_state") in ("none", "unavailable") and sl.get("location_ok"):
+        r.append("location confirmed by the caller but not found on the map")
+    if "suspicious" in probs:
+        r.append("possible public threat")
+    return r
+
+
+# ---- geographic verification (OpenStreetMap). A match is only used after the caller confirms it.
+GEO_URL = "https://nominatim.openstreetmap.org/search"
+
+
+@st.cache_data(show_spinner=False, max_entries=1000, ttl=86400)
+def geocode_india(place: str) -> list[dict] | None:
+    """Up to 3 matches in India. Returns None when the service cannot be reached (not the same as "no match")."""
+    mock = os.getenv("SAHAYAK_GEO_MOCK")                 # tests only: a JSON file {query: [matches]}
+    if mock:
+        try:
+            return json.loads(Path(mock).read_text(encoding="utf-8")).get(place.lower(), [])
+        except Exception:
+            return None
+    import urllib.parse
+    import urllib.request
+    try:
+        q = urllib.parse.urlencode({"q": place, "format": "jsonv2", "countrycodes": "in", "limit": 3, "addressdetails": 0})
+        req = urllib.request.Request(f"{GEO_URL}?{q}", headers={"User-Agent": "Sahayak112-training-demo/1.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            rows = json.loads(resp.read().decode("utf-8"))
+        return [{"name": r_["display_name"], "lat": float(r_["lat"]), "lon": float(r_["lon"])} for r_ in rows[:3]]
+    except Exception:
+        return None
+
+
+def verify_place(call: dict) -> None:
+    """Look the caller's place up on the map. The caller's own words stay the record either way."""
+    sl = call["slots"]
+    found = geocode_india(sl["location"]) if sl.get("location") else None
+    if found is None:
+        sl["geo_state"], sl["geo_options"] = "unavailable", []
+    elif not found:
+        sl["geo_state"], sl["geo_options"] = "none", []
+    else:
+        sl["geo_state"], sl["geo_options"] = ("one" if len(found) == 1 else "many"), found
+        if len(found) == 1:
+            sl["geo"] = found[0]
+    add_event(call, "🗺️", {"unavailable": "Map service not reachable: location must be confirmed by the caller",
+                          "none": "Place not found on the map: asking for a nearby landmark",
+                          "one": "Place found on the map: awaiting caller confirmation",
+                          "many": f"{len(found or [])} possible places on the map: asking the caller to choose"}[sl["geo_state"]])
 
 
 def clean_heard(text: str, call: dict) -> str:
@@ -1173,6 +1344,30 @@ def extract_into(call: dict, text: str) -> list[str]:
         sl["problems"] = list(dict.fromkeys(sl.get("problems", []) + probs))
         if set(sl["problems"]) - before:
             got.append("problems")
+    if pend == "location_pick":
+        low = " " + text.lower() + " "
+        pick = next((k for k, words in enumerate([["1", "one", "first", "pehla", "पहला", "एक"], ["2", "two", "second", "doosra", "दूसरा", "दो"],
+                                                  ["3", "three", "third", "teesra", "तीसरा", "तीन"]])
+                     if any(f" {w} " in low or low.strip().startswith(w) for w in words)), None)
+        opts = sl.get("geo_options", [])
+        if pick is not None and pick < len(opts):
+            sl["geo"], sl["location_ok"] = opts[pick], True
+            got.append("location_ok")
+            return got
+        if yes_no(text) is False or "none" in low or "koi nahi" in low:
+            sl["geo_state"] = "none"                      # none of these: ask for a nearby landmark
+            return got
+    if pend == "location_landmark" and text.strip() and yes_no(text) is None:
+        extra = extract_location_text(text, "location") or text.strip()
+        place = f"{extra}, {sl.get('location')}" if sl.get("location") and sl["location"].lower() not in extra.lower() else extra
+        sl["location"], sl["location_ok"] = place, False
+        sl["location_map"] = place_on_demo_map(place)
+        sl["location_xy"] = LANDMARKS[place]
+        call["geo_retry"] = call.get("geo_retry", 0) + 1
+        call["asked"] = [q for q in call["asked"] if q not in ("location_confirm", "location_pick")]
+        verify_place(call)
+        got.append("location")
+        return got
     if pend == "location_confirm":
         yn = yes_no(text)
         if yn is True:
@@ -1197,6 +1392,8 @@ def extract_into(call: dict, text: str) -> list[str]:
         sl["location"], sl["location_ok"] = place, False
         sl["location_map"] = place_on_demo_map(place)
         sl["location_xy"] = LANDMARKS[place]
+        sl.pop("geo", None)
+        verify_place(call)
         call["asked"] = [q for q in call["asked"] if q != "location_confirm"]
         got.append("location")
     people_ctx = re.search(r"(\d+|\b(one|two|three|four|five|six|seven|eight|nine|ten|several|many|kai|bahut)\b|"
@@ -1235,6 +1432,8 @@ def call_triage(call: dict) -> dict:
         sev = max(sev, 4)
     if (sl.get("people") or 0) >= 3 and sev >= 4:
         sev = 5
+    if set(sl.get("problems", [])) & {"trafficking", "kidnapping", "sexual_violence"}:
+        sev = max(sev, 4)                                 # serious harm to a person: never shown as "injury, stable"
     probs = sl.get("problems", [])
     tri.update(is_emergency=True, severity=sev, location=sl.get("location"), people=sl.get("people"),
                incident_type=TYPE_OF.get(probs[0], tri.get("incident_type", "Medical")) if probs else tri.get("incident_type", "Medical"),
@@ -1280,13 +1479,23 @@ def next_question(call: dict) -> str | None:
         for slot in ("name", "phone"):
             if _needs(call, slot) and slot not in asked:
                 return slot
-    if sl.get("location") and not sl.get("location_ok") and "location_confirm" not in asked and sl.get("problems"):
-        return "location_confirm"
+    if sl.get("location") and not sl.get("location_ok") and sl.get("problems"):
+        if sl.get("geo_state") == "many" and call["asked"].count("location_pick") < 2:
+            return "location_pick"
+        if sl.get("geo_state") == "none" and call.get("geo_retry", 0) < 1 and "location_landmark" not in asked:
+            return "location_landmark"
+        if "location_confirm" not in asked:
+            return "location_confirm"
     if not sl.get("problems"):
         return "problem_again" if "problem_again" not in asked and call["turns"] and any(t_["role"] == "caller" for t_ in call["turns"]) else (
             None if "problem_again" in asked else "problem")
     if not sl.get("location"):
         return "location" if "location" not in asked else ("location_again" if "location_again" not in asked else None)
+    if not sl.get("location_ok") and sl.get("geo_state") == "many" and call["asked"].count("location_pick") < 2:
+        return "location_pick"
+    if not sl.get("location_ok") and sl.get("geo_state") == "none" and call.get("geo_retry", 0) < 1 \
+            and "location_landmark" not in asked:
+        return "location_landmark"
     if not sl.get("location_ok") and "location_confirm" not in asked:
         return "location_confirm"
     for p in sl["problems"]:
@@ -1466,11 +1675,14 @@ LEVEL_ORDER = "OABCDE"
 
 
 MIN_LEVEL = {"fire": "C", "collapse": "D", "road_accident": "C", "gas_leak": "C", "flood": "C", "women_safety": "C", "child": "C",
-             "crime": "B", "electric": "B", "medical": "A"}     # e.g. every building fire is at least P2
+             "crime": "B", "electric": "B", "medical": "A", "trafficking": "C", "kidnapping": "D", "missing_person": "B",
+             "sexual_violence": "C", "suspicious": "C", "other": "B"}     # e.g. every building fire is at least P2
 
 
 def response_level(call: dict) -> str:
     lvl = _response_level(call)
+    if "other" in call["slots"].get("problems", []) and (call["slots"].get("people") or 0) >= 3 and LEVEL_ORDER.index(lvl) < LEVEL_ORDER.index("C"):
+        lvl = "C"                                         # an unclassified event affecting several people is at least urgent
     for p in call["slots"].get("problems", []):
         if lvl != "O" and LEVEL_ORDER.index(MIN_LEVEL.get(p, "A")) > LEVEL_ORDER.index(lvl):
             lvl = MIN_LEVEL[p]
@@ -1554,6 +1766,32 @@ def run_card(call: dict, level: str) -> list[dict]:
         elif p == "child":
             add("Police", "search for the child")
             add("Child Helpline", "child protection follow-up")
+        elif p == "trafficking":
+            add("Police", "urgent safeguarding check: verify and protect")
+            if hi >= LEVEL_ORDER.index("D"):
+                add("Police", "backup unit")
+            if call.get("subject") == "child":
+                add("Child Helpline", "child protection (Childline 1098)")
+            if call.get("subject") == "woman":
+                add("Women Helpline", "support for the woman")
+        elif p == "kidnapping":
+            add("Police", "immediate search: vehicle, direction, description")
+            add("Police", "second unit to block the likely route")
+            if call.get("subject") == "child":
+                add("Child Helpline", "child protection (Childline 1098)")
+        elif p == "missing_person":
+            add("Police", "missing person report and local search")
+        elif p == "sexual_violence":
+            add("Police", "protect the survivor and secure evidence")
+            add("Ambulance (EMS)", "medical care for the survivor")
+            add("Women Helpline", "support (181 / One Stop Centre)")
+        elif p == "suspicious":
+            add("Police", "check the threat and secure the area")
+            if any(w in caller_text(call).lower() for w in ("bomb", "explosive", "बम")):
+                add("Fire & Rescue", "standby: possible explosive (bomb squad via police)")
+                add("Ambulance (EMS)", "standby for casualties")
+        elif p == "other":
+            add("Police", "ERV to assess an unclassified emergency")
         elif p == "electric":
             add("Electricity Board", "isolate the power line")
             if hi >= LEVEL_ORDER.index("C"):
@@ -1781,6 +2019,11 @@ def caller_says(call: dict, text: str) -> dict:
                            "I will stay on the line until they reach you."))
                 add_event(call, "⏳", "Caller needs nothing more: waiting for " + ", ".join(a_["unit"] for a_ in coming))
                 return {"reply": call["turns"][-1]["text"], "understood": ["done_waiting"], "severity": call["severity"]}
+            if not call.get("dispatched"):
+                agent_say(call, "112 पर कॉल करने के लिए धन्यवाद। सुरक्षित रहें।" if hindi else "Thank you for calling 112. Stay safe.")
+                call["ended"], call["ended_by"], call["ended_at"], call["pending"] = True, "caller", time.time(), None
+                add_event(call, "🔚", "Call closed: no emergency to dispatch")
+                return {"reply": call["turns"][-1]["text"], "understood": ["closed"], "severity": call["severity"]}
             hand_over(call, "Caller needed nothing more: call handed over to the crew")
             return {"reply": call["turns"][-1]["text"], "understood": ["done"], "severity": call["severity"]}
         call["pending"] = None                       # new information: handle it as a normal turn, then ask again
@@ -1803,8 +2046,50 @@ def caller_says(call: dict, text: str) -> dict:
             reply += " " + _l(CALL_Q[call["pending"]], hindi)
         agent_say(call, reply)
         return {"reply": reply, "understood": ["eta_question"], "severity": call["severity"]}
+    u = understand(text)
+    if u["certainty"] != "reported" or not call.get("certainty"):
+        call["certainty"] = u["certainty"] if not (call.get("certainty") == "suspected" and u["certainty"] == "reported") else "suspected"
+    if u["time"] == "past" or not call.get("time"):
+        call["time"] = u["time"]
+    if u["subject"] and not call.get("subject"):
+        call["subject"] = u["subject"]
+    if not call.get("original"):
+        call["original"] = text.strip()                       # the caller's first words, kept as said
+    if call.get("pending") == "happening_now":
+        yn = yes_no(text)
+        if yn is True or any(w in (" " + text.lower() + " ") for w in NOW_WORDS):
+            call["certainty"] = "reported"                    # it is a real, current emergency
+            add_event(call, "📣", "Caller confirmed the emergency is happening now")
+        elif yn is False:
+            add_event(call, "ℹ️", "Information request, not an emergency report: no dispatch")
+            agent_say(call, ("ठीक है, कोई टीम नहीं भेजी जा रही। अगर कभी ऐसा हो, तो तुरंत 112 पर कॉल करें और जगह बताएँ। "
+                             "क्या कुछ और है जिसमें मैं मदद कर सकता हूँ?") if hindi else
+                      ("Okay, no team is being sent. If this ever happens, call 112 straight away and tell us where. "
+                       "Is there anything else I can help with?"))
+            call["pending"] = "anything_else"
+            return {"reply": call["turns"][-1]["text"], "understood": ["not_an_emergency"], "severity": call["severity"]}
+    if call.get("certainty") in ("question", "hypothetical") and not call.get("explained_q"):
+        call["explained_q"] = True
+        agent_say(call, ("मैं आपकी मदद के लिए हूँ। क्या यह अभी कहीं हो रहा है?" if hindi else
+                         "I am here to help. Is this happening somewhere right now?"))
+        call["pending"] = "happening_now"
+        call["original"] = call.get("original") or text.strip()
+        return {"reply": call["turns"][-1]["text"], "understood": ["question"], "severity": call["severity"]}
     got = extract_into(call, text)
     sl = call["slots"]
+    if use_groq and groq_key and Groq is not None and (not sl.get("problems") or not call.get("ai_label")):
+        ai = llm_classify(caller_text(call)[:600], groq_key, groq_model)
+        if ai.get("category") and ai["category"] not in sl.get("problems", []):
+            sl["problems"] = list(dict.fromkeys(sl.get("problems", []) + [ai["category"]])); got.append("problems")
+        call["ai_label"] = ai.get("label") or call.get("ai_label")
+        if ai.get("certainty") in ("suspected", "question", "hypothetical"):
+            call["certainty"] = ai["certainty"]
+        call["subject"] = call.get("subject") or ai.get("subject")
+    # a description that matches no known type is still a report: keep it as "Other / Unclassified"
+    caller_turns_ = sum(1 for t_ in call["turns"] if t_["role"] == "caller")
+    if not sl.get("problems") and "problem_again" in call["asked"] and call.get("pending") == "problem_again" \
+            and len(text.split()) >= 3 and call.get("certainty") not in ("question", "hypothetical"):
+        sl["problems"] = ["other"]; got.append("problems")
     parts = []
     pend0 = call.get("pending")
     if (pend0 in YES_NO and pend0 not in got) or (not got and pend0 not in ("description", "child_desc", "name")):
@@ -1821,8 +2106,11 @@ def caller_says(call: dict, text: str) -> dict:
     if "phone" in got:
         add_event(call, "📱", "Call-back number: " + (sl["phone"] if sl["phone"] == "not given" else "••••••" + sl["phone"][-4:]))
     if "problems" in got or "location" in got:
-        what = ", ".join((PROBLEM_HI.get(p, PROBLEMS[p]["label"]) if hindi else PROBLEMS[p]["label"].lower())
-                         for p in sl.get("problems", [])) or ("आपात स्थिति" if hindi else "an emergency")
+        if sl.get("problems") == ["other"]:
+            what = "आपकी रिपोर्ट दर्ज है" if hindi else "I have noted your report"
+        else:
+            what = (", ".join(PROBLEM_HI.get(p, PROBLEMS[p]["label"]) for p in sl.get("problems", [])) if hindi
+                    else incident_label(call)[0].lower() + incident_label(call)[1:]) if sl.get("problems") else ("आपात स्थिति" if hindi else "an emergency")
         where = sl.get("location")
         parts.append((f"ठीक है, {what}" + (f", {where} के पास।" if where else "।")) if hindi else
                      (f"Okay, {what}" + (f" near {where}." if where else ".")))
@@ -1835,7 +2123,8 @@ def caller_says(call: dict, text: str) -> dict:
     # dispatch as soon as we know what and where (like a real call-taker, before all questions are done)
     caller_turns = sum(1 for t_ in call["turns"] if t_["role"] == "caller")
     unclear = not sl.get("problems") and sl.get("location") and caller_turns >= 3      # still unclear: police control room takes it
-    if (sl.get("problems") or unclear) and sl.get("location") and sl.get("location_ok") and not call["dispatched"]:
+    if (sl.get("problems") or unclear) and sl.get("location") and sl.get("location_ok") and not call["dispatched"] \
+            and call.get("certainty") not in ("question", "hypothetical"):
         rec = add_call(caller_text(call), tri, "Emergency call")
         call["record"] = rec["Call ID"]
         # agents classify and route (traced); the CAD run card decides the actual units
@@ -1843,6 +2132,12 @@ def caller_says(call: dict, text: str) -> dict:
                           hint=(sl.get("problems") or [call.get("dial_hint")])[0], dispatch=False)
         parts += cad_dispatch(call, hindi)
         call["dispatched"] = True
+        reasons = escalation_reasons(call)
+        if reasons:
+            call["escalated"] = reasons
+            add_event(call, "🔔", "Duty dispatcher alerted: " + "; ".join(reasons))
+            parts.append("इस कॉल की जानकारी ड्यूटी डिस्पैचर को भी दे दी गई है।" if hindi else
+                         "A duty dispatcher has also been alerted to this call.")
         run_["assignments"] = call["assignments"]          # same list: later units appear in the trace too
         run_["call"] = call
         rec["assignments"], rec["teams"] = call["assignments"], [a_["dept"] for a_ in call["assignments"]]
@@ -1868,6 +2163,11 @@ def caller_says(call: dict, text: str) -> dict:
             call["said_instructions"].append(key)
             parts.append(_l(INSTRUCT[key], hindi))
     pend = call.get("pending")
+    if pend == "location_confirm" and not sl.get("location_ok") and "location" not in got and sl.get("location") \
+            and call["misses"].get("location_confirm", 0) < 2 and yes_no(text) is None:
+        call["misses"]["location_confirm"] = call["misses"].get("location_confirm", 0) + 1
+        agent_say(call, " ".join(p for p in parts if p) + " " + _l(SAY["yes_no_again"], hindi) + " " + question_text(call, "location_confirm"))
+        return {"reply": call["turns"][-1]["text"], "understood": got, "severity": call["severity"], "reasked": pend}
     if pend in YES_NO and pend not in got and call["misses"].get(pend, 0) == 1 and not (set(got) & {"problems", "location"}):
         # the answer did not say yes or no: ask the same question once more, plainly
         call["misses"][pend] += 1
@@ -1927,6 +2227,8 @@ CARD_CSS = """
 .tl{list-style:none;margin:0;padding:0}.tl li{display:grid;grid-template-columns:88px 22px 1fr;gap:4px;font-size:.84rem;padding:3px 0}
 .tl time{opacity:.55;font-variant-numeric:tabular-nums}
 .facts{margin-top:8px;display:grid;gap:2px}
+.rr{display:grid;grid-template-columns:130px 1fr;gap:8px;font-size:.82rem;padding:3px 0;border-top:1px solid rgba(128,128,128,.12)}
+.rr span:first-child{opacity:.6}
 .fr{display:grid;grid-template-columns:22px 104px 1fr auto;gap:6px;align-items:center;font-size:.84rem;padding:4px 0;
   border-top:1px solid rgba(128,128,128,.14)}.fr:first-child{border-top:0}
 .fi{width:18px;height:18px;border-radius:50%;display:grid;place-items:center;font-size:.7rem;font-weight:800;background:rgba(128,128,128,.2)}
@@ -1986,7 +2288,30 @@ def incident_card_html(c_: dict) -> str:
         f"<span class='fl'>{f_['label']}</span>"
         f"<span class='fv'>{f_['value'] or ('asking now…' if f_['asking'] else 'not yet')}</span>"
         f"<span class='fs'>{f_['src'] if f_['value'] else ''}</span></div>" for f_ in facts)
-    sysbox = (f"<div class='sys'><span>📟 <b>System</b></span><span>Caller ID (ANI): {c_.get('ani', 'withheld')}</span>"
+    missing = [n for n, ok in [("location confirmation", sl.get("location_ok")), ("what happened", sl.get("problems")),
+                               ("number of people", sl.get("people")), ("danger check", checked)] if not ok]
+    nxt = ("Ask: " + question_text(c_, pend) if pend and pend in CALL_Q or pend in ("location_confirm", "location_pick", "location_landmark")
+           else "Units responding; keep the caller updated" if c_.get("dispatched") else "Collect location and what happened")
+    geo_txt = ({"one": "found on map", "many": "several map matches", "none": "not found on map",
+                "unavailable": "map service unavailable"}.get(sl.get("geo_state"), "not checked")
+               + (" · caller confirmed" if sl.get("location_ok") else " · not yet confirmed"))
+    rec_rows = [("Original statement", f"“{c_.get('original', '')}”"), ("Incident", incident_label(c_)),
+                ("Operational category", ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])) or "not yet clear"),
+                ("Priority", (LEVELS[c_["level"]][0] + (" · urgent safeguarding assessment"
+                              if set(sl.get("problems", [])) & {"trafficking", "kidnapping", "sexual_violence", "child"} else ""))
+                             if c_.get("level") else "set when the location is confirmed"),
+                ("Certainty", {"reported": "Reported by caller", "suspected": "Suspected, not confirmed", "question": "Question, not a report",
+                               "hypothetical": "Hypothetical, not a report"}.get(c_.get("certainty"), "—")),
+                ("Time", "Reported as past" if c_.get("time") == "past" else "Now / not stated"),
+                ("At risk", {"child": "A child", "woman": "A woman"}.get(c_.get("subject"), "—")),
+                ("Reported location", (sl.get("location") or "not given") + f" ({geo_txt})"),
+                ("Map match", sl["geo"]["name"][:90] if sl.get("geo") else "—"),
+                ("Missing", ", ".join(missing) or "nothing critical"), ("Next step", nxt),
+                ("Dispatcher", "Alerted: " + "; ".join(c_["escalated"]) if c_.get("escalated") else "Not needed so far")]
+    record = ("<div class='rec'><div class='k' style='font-size:.74rem;text-transform:uppercase;opacity:.6;margin:12px 0 4px'>"
+              "🗂️ Incident record</div>" + "".join(f"<div class='rr'><span>{k}</span><span>{v}</span></div>" for k, v in rec_rows)
+              + "<div style='font-size:.72rem;opacity:.6;margin-top:6px'>AI classification is not proof that an allegation is true.</div></div>")
+    sysbox = record + (f"<div class='sys'><span>📟 <b>System</b></span><span>Caller ID (ANI): {c_.get('ani', 'withheld')}</span>"
               f"<span>Received: {ist_stamp(c_['started'])}</span>"
               f"<span>Dialled: {c_.get('dialed', '112')}</span><span>Line: mobile</span>"
               f"<span>Language: {'Hindi' if c_.get('hindi') else 'English'}</span>"
@@ -2903,6 +3228,13 @@ with tab_call:
                     st.rerun(scope="app")                       # a unit arrived: show (and say) it in the call
                 st.markdown(incident_card_html(c_), unsafe_allow_html=True)
             call_panel()
+            geo_ = call["slots"].get("geo")
+            if geo_ and call["slots"].get("location_ok"):
+                st.markdown(f"##### 🗺️ CAD map · verified location  \n<span style='opacity:.7;font-size:.85rem'>{geo_['name']}</span>",
+                            unsafe_allow_html=True)
+                st.map(pd.DataFrame([{"lat": geo_["lat"], "lon": geo_["lon"]}]), zoom=14, size=40, color="#D62839")
+            elif call["slots"].get("location"):
+                st.caption("🗺️ The incident appears on the CAD map once its location is verified.")
 
 DEPT_CSS = """
 <style>
