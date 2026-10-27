@@ -1,3 +1,5 @@
+from __future__ import annotations   # type hints such as `str | None` also work on older Python versions
+
 import base64
 import hashlib
 import io
@@ -688,11 +690,13 @@ DEPARTMENTS = {   # name -> icon, Indian helpline, vehicle type it sends (None =
     "Child Helpline":    {"icon": "🧒", "line": "1098", "fleet": None,          "code": "CHD", "agency": "Childline", "lines": "1098"},
 }
 PROBLEMS = {      # the ONLY problem categories the router may choose; each one says which teams must act
-    "fire":          {"label": "Fire", "kw": ["fire", "smoke", "flames", "burning", "blaze", "aag", "dhuan"], "teams": ["Fire & Rescue"]},
+    "fire":          {"label": "Fire", "kw": ["fire", "smoke", "flames", "burning", "blaze", "aag", "dhuan", "fire brigade", "fire engine",
+                                              "fire tender", "damkal", "दमकल"], "teams": ["Fire & Rescue"]},
     "gas_leak":      {"label": "Gas leak", "kw": ["gas leak", "gas smell", "smell of gas", "cylinder", "lpg"], "teams": ["Fire & Rescue", "Gas Emergency"]},
     "medical":       {"label": "Medical emergency", "kw": ["unconscious", "not breathing", "heart attack", "chest pain", "fainted", "seizure",
                                                           "stroke", "bleeding", "injured", "hurt", "labour pain", "snake bite", "poison",
-                                                          "overdose", "behosh", "fell", "not moving", "collapsed", "burns", "faint"],
+                                                          "overdose", "behosh", "fell", "not moving", "collapsed", "burns", "faint", "ambulance",
+                                                          "एम्बुलेंस", "एंबुलेंस"],
                       "teams": ["Ambulance (EMS)"]},
     "road_accident": {"label": "Road accident", "kw": ["accident", "crash", "collided", "collision", "hit by", "overturned", "run over",
                                                        "skidded"], "teams": ["Ambulance (EMS)", "Police"]},
@@ -730,7 +734,9 @@ PROBLEMS = {      # the ONLY problem categories the router may choose; each one 
                                                                             "explosive", "shots fired", "gunshot", "firing", "riot", "mob",
                                                                             "stampede", "terror", "sandigdh", "laawaris", "लावारिस",
                                                                             "संदिग्ध", "बम", "दंगा", "भगदड़"], "teams": ["Police"]},
-    "other":         {"label": "Other / Unclassified emergency", "kw": [], "teams": ["Police"]},
+    "other":         {"label": "Other / Unclassified emergency", "kw": ["send police", "need police", "call the police", "police chahiye",
+                                                                      "police bhejo", "police bhejiye", "पुलिस भेजो", "पुलिस भेजिए",
+                                                                      "पुलिस चाहिए"], "teams": ["Police"]},
 }
 SUBSUMES = {"child": ["missing_person"], "kidnapping": ["crime"], "trafficking": ["crime", "missing_person"],
             "sexual_violence": ["crime", "women_safety"]}       # a more specific type replaces a general one
@@ -760,7 +766,7 @@ def rule_problems(text: str) -> list[tuple[str, str]]:
         if hit:
             found.append((pid, hit))
     ids = {pid for pid, _ in found}
-    drop = {d for pid in ids for d in SUBSUMES.get(pid, [])}
+    drop = {d for pid in ids for d in SUBSUMES.get(pid, [])} | ({"other"} if len(ids) > 1 else set())
     return [(pid, hit) for pid, hit in found if pid not in drop]
 
 
@@ -1045,6 +1051,98 @@ NOT_A_PLACE = {"mere", "mera", "meri", "hamare", "hamara", "yahan", "wahan", "gh
                "घर", "kitchen", "room", "home", "house", "my", "our", "this", "here", "there"}
 
 
+# Words that mark a part of an Indian address. They help find where a place is in a sentence; they are not a list of
+# allowed places, so any colony, village or street name around them is kept exactly as said.
+ADDRESS_WORDS = ["house no", "house number", "h.no", "h no", "flat", "plot", "khasra", "gali", "lane", "street", "road", "rd", "marg",
+                 "path", "highway", "nh", "chowk", "chauraha", "crossing", "circle", "nagar", "colony", "vihar", "enclave", "apartment",
+                 "society", "sector", "phase", "block", "pocket", "extension", "layout", "market", "bazaar", "bazar", "mohalla",
+                 "village", "gaon", "gram", "tehsil", "taluka", "mandal", "district", "zila", "jila", "station", "railway station",
+                 "bus stand", "bus stop", "bus adda", "depot", "metro", "airport", "hospital", "police station", "thana", "chowki",
+                 "school", "college", "university", "temple", "mandir", "masjid", "gurudwara", "church", "park", "mall", "bridge",
+                 "flyover", "toll", "pin", "pincode", "ganj", "pur", "puram", "abad", "garh", "wadi", "palli", "halli", "peth",
+                 "गली", "मोहल्ला", "नगर", "कॉलोनी", "कालोनी", "सेक्टर", "गाँव", "गांव", "ज़िला", "जिला", "तहसील", "रोड", "मार्ग",
+                 "चौक", "थाना", "अस्पताल", "स्टेशन", "बस अड्डा", "बाज़ार", "बाजार", "मंदिर", "मस्जिद", "गुरुद्वारा", "पुल"]
+INDIA_AREAS = ["andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh", "goa", "gujarat", "haryana", "himachal pradesh",
+               "jharkhand", "karnataka", "kerala", "madhya pradesh", "maharashtra", "manipur", "meghalaya", "mizoram", "nagaland",
+               "odisha", "punjab", "rajasthan", "sikkim", "tamil nadu", "telangana", "tripura", "uttar pradesh", "uttarakhand",
+               "west bengal", "andaman and nicobar", "chandigarh", "dadra and nagar haveli", "daman and diu", "delhi", "new delhi",
+               "jammu and kashmir", "ladakh", "lakshadweep", "puducherry", "mumbai", "kolkata", "chennai", "bengaluru", "bangalore",
+               "hyderabad", "ahmedabad", "pune", "jaipur", "lucknow", "kanpur", "nagpur", "indore", "bhopal", "patna", "ghaziabad",
+               "noida", "gurugram", "gurgaon", "faridabad", "meerut", "agra", "varanasi", "surat", "vadodara", "ludhiana", "amritsar",
+               "kochi", "thiruvananthapuram", "coimbatore", "madurai", "visakhapatnam", "vijayawada", "bhubaneswar", "guwahati",
+               "ranchi", "raipur", "dehradun", "shimla", "srinagar", "jammu", "mysuru", "mangaluru", "nashik", "aurangabad",
+               "दिल्ली", "मुंबई", "कोलकाता", "चेन्नई", "उत्तर प्रदेश", "बिहार", "गाज़ियाबाद", "गाजियाबाद", "नोएडा", "लखनऊ", "जयपुर"]
+# Known areas only tell us whether the city/state is already in the place; unknown places are accepted just the same.
+
+
+def _has_address_word(chunk: str) -> bool:
+    low = " " + re.sub(r"[^\w\u0900-\u097F. ]", " ", chunk.lower()) + " "
+    if re.search(r"\b\d{6}\b", chunk):                          # a PIN code
+        return True
+    if any(f" {w} " in low for w in ADDRESS_WORDS):
+        return True
+    return bool(re.search(r"\w{2,}(nagar|pur|puram|abad|garh|ganj|wadi|palli|halli|peth)\b", low))   # Shastrinagar, Rampur…
+
+
+def extract_address(text: str) -> str | None:
+    """Find an address written without a cue word: "House 12, Gali 4, Shastri Nagar, Meerut" or "Sector 62 Noida, UP"."""
+    best = None
+    for sent in re.split(r"[.!?।]", text):
+        chunks = [c.strip() for c in sent.split(",") if c.strip()]
+        run, runs = [], []
+        for c in chunks:
+            words = c.split()
+            low = c.lower()
+            placeish = (_has_address_word(c) or any(a in low for a in INDIA_AREAS)
+                        or (1 <= len(words) <= 4 and not any(w.lower().strip(".") in LOC_STOP for w in words) and not rule_problems(c)
+                            and run))                     # a short name right after an address part ("…, Shastri Nagar, Meerut")
+            if placeish and not (rule_problems(c) and not _has_address_word(c)):
+                run.append(c)
+            else:
+                if run:
+                    runs.append(run)
+                run = []
+        if run:
+            runs.append(run)
+        for r_ in runs:
+            if any(_has_address_word(c) or any(a in c.lower() for a in INDIA_AREAS) for c in r_):
+                cand = ", ".join(r_)
+                if best is None or len(cand) > len(best):
+                    best = cand
+    if best:
+        # trim words before the address starts inside the first chunk ("there is a fire at House 12" is handled by cues)
+        best = re.sub(r"^(?:.*?\b(?:at|in|near|on|to)\s+)", "", best, flags=re.I) if re.search(r"\b(?:at|in|near|on|to)\s", best.split(",")[0], re.I) else best
+        best = best.strip(" ,.")
+        first, *rest = [c.strip() for c in best.split(",")]
+        fw = first.split()
+        num_words = ("number", "no", "no.", "nambar", "नंबर", "नम्बर")
+        while fw and fw[0].lower() in {"my", "our", "mera", "meri", "mere", "hamara", "hamare", "मेरा", "मेरी", "मेरे", "हमारा", "हमारे"}:
+            fw = fw[1:]
+        while fw and fw[0].lower() in {"ghar", "घर", "house", "home"} and not (len(fw) > 1 and (fw[1].lower() in num_words or fw[1].isdigit())):
+            fw = fw[1:]                                   # "मेरा घर गली नंबर 3" -> "गली नंबर 3", but "House number 12" stays
+        first = " ".join(fw)
+        last = rest[-1] if rest else first
+        last2 = re.sub(r"\s+" + HI_POST + r"(?:\s+(?:है|hai|हैं|ho raha hai|हो रहा है))?\s*$", "", last, flags=re.I)
+        last2 = re.sub(r"\s+(?:is|hai|है)\s*$", "", last2, flags=re.I)
+        parts = ([first] + rest[:-1] + [last2]) if rest else [last2 if first == last else first]
+        best = ", ".join(p_ for p_ in parts if p_).strip(" ,.")
+    return best or None
+
+
+def location_query(place: str, call: dict | None = None) -> str:
+    """The search text for the map, built from the caller's words (the words themselves are kept unchanged for audit):
+    remove cue words and Hindi postpositions, keep every name, and add ", India" so the search stays in India."""
+    q = " ".join(place.split())
+    q = re.sub(r"^(?:near(?:by)?|at|in|on|to|opposite|opp\.?|behind|beside|next to|outside|inside|close to|in front of|the)\s+", "", q, flags=re.I)
+    q = re.sub(r"\s+" + HI_POST + r"(?:\s+(?:है|hai|हैं))?\s*$", "", q, flags=re.I)
+    q = re.sub(r"\s+(?:near|opposite|opp\.?|behind|beside|next to|close to|in front of|ke paas|ke pass|के पास|के सामने)\s+", ", ", q, flags=re.I)
+    q = q.strip(" ,.-")
+    if call and call.get("slots", {}).get("area_hint") and call["slots"]["area_hint"].lower() not in q.lower():
+        q = f"{q}, {call['slots']['area_hint']}"         # a city or state the caller mentioned separately
+    last = q.split(",")[-1].strip().lower()
+    return q if last in ("india", "भारत") else f"{q}, India"
+
+
 def extract_location_text(text: str, pending: str | None = None) -> str | None:
     """The caller's location exactly as said (no forced match to a list). Returns None when no place was given."""
     t = " ".join(text.split())
@@ -1068,13 +1166,18 @@ def extract_location_text(text: str, pending: str | None = None) -> str | None:
                     break
                 continue                                  # skip leading filler ("to talk to …")
             out.append(tok.rstrip(".!?;:"))
-            if tok[-1:] in ".!?;" or len(out) >= 8:
+            if tok[-1:] in ".!?;" or len(out) >= 14:
                 break
             if tok.endswith(",") and k + 1 < len(toks) and toks[k + 1].strip(",.").lower() in LOC_STOP:
+                break
+            if len(out) >= 8 and not _has_address_word(" ".join(toks[k + 1:k + 4])):
                 break
         place = tidy(out)
         if place:
             return place
+    addr_first = extract_address(t)
+    if addr_first and "," in addr_first:
+        return addr_first
     # Hindi / Hinglish: "India Gate ke paas", "मंदिर के पास", "Sector 18 mein"
     m = re.search(r"((?:[^\s,।.]+\s+){0,3}[^\s,।.]+)\s+" + HI_POST + r"(?=\s|$|[,।.])", t, flags=re.I)
     if m:
@@ -1082,6 +1185,10 @@ def extract_location_text(text: str, pending: str | None = None) -> str | None:
         place = tidy(words[-4:])
         if place:
             return place
+    # an address said without a cue word ("House 12, Gali 4, Shastri Nagar, Meerut")
+    addr = extract_address(t)
+    if addr and pending not in ("location", "location_again"):
+        return addr
     # answering "where are you?": the whole short answer is the place
     if pending in ("location", "location_again") and yes_no(t) is None:
         # keep only the parts that are not about the problem: "aag lagi hai. Red Fort. Mandir" -> "Red Fort, Mandir"
@@ -1092,9 +1199,12 @@ def extract_location_text(text: str, pending: str | None = None) -> str | None:
         words = re.sub(r"^(?:it is|it's|i am|i'm|we are|the location is|my location is|location|address|पता|जगह)\s+", "", t2, flags=re.I)
         words = words.strip(" .,!?").split()
         if any(w.lower().strip(",.") in LOC_STOP for w in words):
-            return None                                   # "a strange smell and people are coughing" is not a place
-        if 1 <= len(words) <= 10:
-            return tidy(words)
+            return addr                                   # "a strange smell and people are coughing" is not a place
+        if 1 <= len(words) <= 14:
+            whole = tidy(words)
+            return whole if not addr or (whole and addr.lower() in whole.lower()) else addr
+    if addr:
+        return addr
     return None
 
 
@@ -1150,6 +1260,11 @@ def question_text(call: dict, q: str) -> str:
                 f"I could not find “{sl.get('location')}” on the map. Please tell me a nearby landmark, locality, district or state.")
     if q == "location_confirm":
         if sl.get("geo_state") == "one" and sl.get("geo"):
+            if sl.get("geo_level") == "area":
+                return (f"मुझे ठीक जगह नहीं मिली, पर इलाका “{sl['geo']['name'][:90]}” मिला। आपने “{sl.get('location')}” बताया। "
+                        "क्या आपात स्थिति इसी इलाके में है?" if hindi else
+                        f"I could not find the exact spot, but I found the area “{sl['geo']['name'][:90]}”. You said “{sl.get('location')}”. "
+                        "Is the emergency in this area?")
             return (f"मुझे नक्शे पर “{sl['geo']['name'][:90]}” मिला। क्या आपात स्थिति यहीं है?" if hindi else
                     f"I found “{sl['geo']['name'][:90]}” on the map. Is that where the emergency is?")
         return (f"मैंने जगह “{sl.get('location')}” लिखी है। क्या यह सही है?" if hindi else
@@ -1348,7 +1463,25 @@ def geocode_india(place: str) -> list[dict] | None:
 def verify_place(call: dict) -> None:
     """Look the caller's place up on the map. The caller's own words stay the record either way."""
     sl = call["slots"]
-    found = geocode_india(sl["location"]) if sl.get("location") else None
+    sl["location_query"] = location_query(sl["location"], call) if sl.get("location") else None
+    found, level = None, None
+    if sl.get("location_query"):
+        parts = [p_.strip() for p_ in sl["location_query"].split(",") if p_.strip()]
+        # exact first, then drop the most specific part each time (house -> street -> colony -> city): an approximate area
+        for k in range(0, max(1, len(parts) - 1)):
+            q_ = ", ".join(parts[k:])
+            if q_.lower() in ("india",):
+                break
+            res = geocode_india(q_)
+            if res is None:
+                found = None
+                break
+            if res:
+                found, level = res, ("exact" if k == 0 else "area")
+                sl["geo_query_used"] = q_
+                break
+            found = []
+    sl["geo_level"] = level
     if found is None:
         sl["geo_state"], sl["geo_options"] = "unavailable", []
     elif not found:
@@ -1357,6 +1490,9 @@ def verify_place(call: dict) -> None:
         sl["geo_state"], sl["geo_options"] = ("one" if len(found) == 1 else "many"), found
         if len(found) == 1:
             sl["geo"] = found[0]
+    if level == "area":
+        add_event(call, "🗺️", f"Exact place not on the map; nearest area found for “{sl.get('geo_query_used')}” (approximate)",
+                  details=f"Location query: {sl.get('location_query')}")
     add_event(call, "🗺️", {"unavailable": "Map service not reachable: location must be confirmed by the caller",
                           "none": "Place not found on the map: asking for a nearby landmark",
                           "one": "Place found on the map: awaiting caller confirmation",
@@ -1435,6 +1571,23 @@ def extract_into(call: dict, text: str) -> list[str]:
             sl["geo"], sl["location_ok"] = opts[pick], True
             got.append("location_ok")
             return got
+        words_ = [w.strip(",.") for w in re.findall(r"[\w\u0900-\u097F]+", low) if len(w.strip(",.")) >= 4]
+        named = [k for k, o in enumerate(opts) if any(w in o["name"].lower() for w in words_ if w not in ("none", "these", "this"))]
+        if len(named) == 1:                               # "it is in Ghaziabad" matches one of the places offered
+            sl["geo"], sl["location_ok"] = opts[named[0]], True
+            add_event(call, "✅", f"Caller chose “{opts[named[0]]['name']}” by naming it", etype="Location verified", actor="Caller")
+            got.append("location_ok")
+            return got
+        area = next((a for a in sorted(INDIA_AREAS, key=len, reverse=True) if a in low), None)
+        if area:                                          # a city or state none of the options had: search again with it
+            sl["area_hint"] = area.title()
+            sl["location"] = f"{sl['location']}, {area.title()}"
+            sl["location_map"] = place_on_demo_map(sl["location"])
+            sl["location_xy"] = LANDMARKS[sl["location"]]
+            call["asked"] = [q for q in call["asked"] if q not in ("location_confirm", "location_pick")]
+            verify_place(call)
+            got.append("location")
+            return got
         if yes_no(text) is False or "none" in low or "koi nahi" in low:
             sl["geo_state"] = "none"                      # none of these: ask for a nearby landmark
             return got
@@ -1469,6 +1622,10 @@ def extract_into(call: dict, text: str) -> list[str]:
         place = llm_location(text.strip(), groq_key, groq_model)
     if not place and not sl.get("location"):        # a demo-map place named in full (a hint, never a replacement)
         place = next((n for n in sorted(DEMO_LANDMARKS, key=len, reverse=True) if n.lower() in text.lower()), None)
+    if place and sl.get("location") and not sl.get("location_ok") and place.lower() in INDIA_AREAS \
+            and place.lower() not in sl["location"].lower():
+        sl["area_hint"] = place                           # "…in Ghaziabad": the colony stays, the city is added to the search
+        place = f"{sl['location']}, {place}"
     if place and place != sl.get("location") and not (pend == "location_confirm" and yes_no(text) is True):
         sl["location"], sl["location_ok"] = place, False
         sl["location_map"] = place_on_demo_map(place)
@@ -2459,6 +2616,7 @@ def incident_card_html(c_: dict) -> str:
                 ("Time", "Reported as past" if c_.get("time") == "past" else "Now / not stated"),
                 ("At risk", {"child": "A child", "woman": "A woman"}.get(c_.get("subject"), "—")),
                 ("Reported location", (sl.get("location") or "not given") + f" ({geo_txt})"),
+                ("Location query", (sl.get("location_query") or "—") + (" · matched at area level" if sl.get("geo_level") == "area" else "")),
                 ("Map match", sl["geo"]["name"][:90] if sl.get("geo") else "—"),
                 ("Missing", ", ".join(missing) or "nothing critical"), ("Next step", nxt),
                 ("Dispatcher", "Alerted: " + "; ".join(c_["escalated"]) if c_.get("escalated") else "Not needed so far")]
@@ -3352,7 +3510,8 @@ def cad_card_html(c_: dict) -> str:
             f"<span>Description</span><span>{esc(describe(c_))}</span>"
             f"<span>Caller's words</span><span>“{esc(c_.get('original', ''))}”</span>"
             f"<span>Location</span><span>{esc(sl.get('location') or 'not given')}{(' → ' + esc(sl['geo']['name'])) if sl.get('geo') else ''}</span>"
-            f"<span>Location status</span><span>{verified} · {geo_state}</span>"
+            f"<span>Location status</span><span>{verified} · {geo_state}{' (area level)' if sl.get('geo_level') == 'area' else ''}</span>"
+            f"<span>Location query</span><span>{esc(sl.get('location_query') or '—')}</span>"
             f"<span>Certainty</span><span>{esc({'reported': 'Reported by caller', 'suspected': 'Suspected, not confirmed', 'question': 'Question, not a report', 'hypothetical': 'Hypothetical'}.get(c_.get('certainty'), '—'))}</span>"
             f"<span>Classification</span><span>{conf}</span>"
             f"<span>Needs attention</span><span>{esc(', '.join(missing) or 'nothing critical')}{(' · escalated: ' + esc('; '.join(c_['escalated']))) if c_.get('escalated') else ''}</span>"
