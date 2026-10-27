@@ -23,6 +23,7 @@ try:
 except ImportError:
     Groq = None
 
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -33,6 +34,34 @@ try:
     IST = ZoneInfo("Asia/Kolkata")
 except Exception:                       # no time-zone database (e.g. some Windows setups without tzdata)
     IST = timezone(timedelta(hours=5, minutes=30), "IST")
+
+
+@st.cache_resource(show_spinner=False)
+def cad_store() -> dict:
+    """One store for the whole server: every session (caller or dispatcher) sees the same incidents and units.
+    It lives in memory, so it resets when the app restarts (a real deployment would use a database)."""
+    return {"incidents": {}, "used_units": set(), "prefs": {}, "seq": 0, "lock": threading.Lock()}
+
+
+CC_DEFAULTS = {
+    "theme": "Dark", "density": "Comfortable", "clock": "12-hour", "refresh": 3, "zoom": 5, "tiles": "Dark",
+    "layers": ["Incidents"], "timeline": "Detailed", "sound": False, "large_text": False, "high_contrast": False,
+    "reduce_motion": False, "approval": "auto", "profile": "Duty Dispatcher", "role": "Dispatch Officer",
+    "sections": ["Overview", "Queue", "Map", "CAD decision", "Agencies", "Timeline"],
+    "cards": ["Active incidents", "P1 critical", "P2 urgent", "Units available", "Units dispatched", "Awaiting assignment",
+              "Average response"],
+    "columns": ["ID", "Incident", "Priority", "Location", "Received", "Status", "Assigned"],
+    "agencies": ["Police", "Fire & Rescue", "Ambulance (EMS)", "Disaster Response", "Gas Emergency", "Electricity Board",
+                 "Women Helpline", "Child Helpline"],
+}
+
+
+def cc_prefs() -> dict:
+    """This user's dashboard preferences (saved defaults per profile live in the shared store)."""
+    if "cc_prefs" not in st.session_state:
+        saved = cad_store()["prefs"].get(CC_DEFAULTS["profile"], {})
+        st.session_state.cc_prefs = {**CC_DEFAULTS, **saved}
+    return st.session_state.cc_prefs
 
 
 def ist(ts: float | None = None) -> datetime:
@@ -46,6 +75,15 @@ def _ampm(d: datetime) -> str:
 
 
 def ist_time(ts: float | None = None) -> str:
+    try:
+        if st.session_state.get("cc_prefs", {}).get("clock") == "24-hour":
+            return ist(ts).strftime("%H:%M:%S")
+    except Exception:
+        pass
+    return _ist_time12(ts)
+
+
+def _ist_time12(ts: float | None = None) -> str:
     """Time of day in IST: 08:45:32 PM."""
     return _ampm(ist(ts))
 
@@ -64,6 +102,12 @@ def ist_human(ts: float | None = None) -> str:
     """Same format everywhere: 26-10-2026 08:45:32 PM IST."""
     return ist_stamp(ts)
 
+
+try:                                    # interactive India map for the Command Center
+    import folium
+    from streamlit_folium import st_folium
+except ImportError:
+    folium, st_folium = None, None
 
 try:                                    # observability: traces, feedback and evaluations in LangSmith
     import langsmith
@@ -1126,15 +1170,52 @@ def yes_no(text: str) -> bool | None:
 
 
 def new_call(hindi: bool) -> dict:
-    st.session_state.call_no = st.session_state.get("call_no", 0) + 1
-    return {"ref": f"112-{st.session_state.call_no:03d}", "hindi": hindi, "turns": [], "slots": {}, "asked": [], "pending": "problem",
+    store = cad_store()
+    with store["lock"]:
+        store["seq"] += 1
+        st.session_state.call_no = store["seq"]
+    _call = {"ref": f"112-{st.session_state.call_no:04d}", "hindi": hindi, "turns": [], "slots": {}, "asked": [], "pending": "problem",
             "misses": {}, "dispatched": False, "assignments": [], "severity": 3, "record": None, "ended": False,
             "started": time.time(), "said_instructions": [], "events": [("📞", "Call started", time.time())]}
+    _call["created"] = time.time()
+    store["incidents"][_call["ref"]] = _call        # visible to the Command Center
+    return _call
 
 
-def add_event(call: dict, icon: str, text: str) -> None:
-    """The incident timeline shown to the dispatcher (and kept in the transcript)."""
-    call.setdefault("events", []).append((icon, text, time.time()))
+EVENT_TYPES = {"📞": "Call received", "🔎": "Incident classified", "📍": "Location reported", "✅": "Location verified",
+               "🗺️": "Location check", "🗂️": "Incident created", "🚨": "Unit dispatched", "➕": "Unit dispatched",
+               "⬆️": "Priority changed", "🔔": "Escalated to dispatcher", "🎧": "Crew contact", "🤝": "Crew contact",
+               "🏥": "Patient transported", "📝": "Agency response completed", "🔚": "Incident closed", "📣": "Status update",
+               "🔦": "Status update", "⏳": "Status update", "ℹ️": "Information", "🙋": "Caller details", "↩️": "Unit released",
+               "🧑‍💼": "Dispatcher action", "🛑": "Unit cancelled", "📡": "Unit recommended", "👍": "Dispatcher approved"}
+EVENT_STATUS = {"Unit dispatched": "Dispatched", "Unit arrived": "On scene", "Patient transported": "Transporting",
+                "Agency response completed": "Completed", "Incident closed": "Closed", "Unit cancelled": "Cancelled",
+                "Unit recommended": "Recommended", "Dispatcher approved": "Approved", "Location verified": "Verified",
+                "Unit released": "Completed", "Escalated to dispatcher": "Attention"}
+
+
+def add_event(call: dict, icon: str, text: str, etype: str | None = None, actor: str | None = None,
+              unit: str | None = None, details: str | None = None) -> None:
+    """Append-only audit trail: nothing is ever overwritten or removed when a status changes."""
+    now = time.time()
+    call.setdefault("events", []).append((icon, text, now))           # simple list (transcript, older views)
+    if etype is None:
+        low = text.lower()
+        etype = ("Unit arrived" if " arrived" in low else "Unit released" if "released" in low else
+                 "Patient transported" if "transporting" in low or "at central hospital" in low else
+                 "Agency response completed" if "atr" in text else EVENT_TYPES.get(icon, "Update"))
+    if unit is None:
+        m = re.match(r"([A-Z]{3}-\d{2})\b", text)
+        unit = m.group(1) if m else None
+    if actor is None:
+        actor = (unit if unit and etype in ("Unit arrived", "Patient transported", "Agency response completed", "Unit released")
+                 else "CAD" if etype in ("Unit dispatched", "Unit recommended", "Priority changed", "Incident created")
+                 else "Call-taker AI" if etype in ("Incident classified", "Location reported", "Location check", "Caller details",
+                                                   "Escalated to dispatcher", "Status update", "Information")
+                 else "Caller" if etype == "Location verified" else "System")
+    audit = call.setdefault("audit", [])
+    audit.append({"id": f"{call.get('ref', 'CFS')}-E{len(audit) + 1:03d}", "ts": now, "icon": icon, "type": etype,
+                  "actor": actor, "unit": unit, "text": text, "status": EVENT_STATUS.get(etype, ""), "details": details})
 
 
 def agent_say(call: dict, text: str) -> None:
@@ -1634,7 +1715,9 @@ SAY.update({
 
 
 def unit_left(a_: dict, now: float | None = None) -> float:
-    """Simulated minutes until this unit arrives (0 when it is there)."""
+    """Simulated minutes until this unit arrives (0 when it is there). A unit not yet dispatched has not moved."""
+    if not a_.get("sent_at"):
+        return float(a_.get("eta") or 0.0)
     now = now or time.time()
     return max(0.0, a_["eta"] - (now - a_.get("sent_at", now)) / a_.get("speed", sim_seconds))
 
@@ -1818,6 +1901,53 @@ def radio(call: dict, a_: dict, level: str) -> None:
     call.setdefault("radio", []).append((time.time(), a_["icon"], txt))
 
 
+def approve_unit(call: dict, a_: dict, actor: str) -> None:
+    """Dispatcher approval turns a recommendation into a dispatch (the only place a unit starts moving)."""
+    if a_.get("approval") == "approved" or a_.get("cancelled"):
+        return
+    now = time.time()
+    a_["approval"], a_["approved_by"], a_["approved_at"] = "approved", actor, now
+    if a_.get("unit"):
+        a_["sent_at"] = now
+    add_event(call, "👍", f"{a_.get('unit') or a_.get('ticket') or a_['dept']} approved by {actor}", etype="Dispatcher approved",
+              actor=actor, unit=a_.get("unit") or a_.get("ticket"))
+    radio(call, a_, call.get("level") or "B")
+    add_event(call, a_["icon"], (f"{a_['unit']} dispatched ({AGENCY.get(a_['dept'], a_['dept'])}): {a_.get('why', '')}" if a_.get("unit")
+                                 else f"{a_['dept']} notified, ticket {a_.get('ticket') or ''}"),
+              etype="Unit dispatched", actor=actor, unit=a_.get("unit") or a_.get("ticket"))
+
+
+def cancel_unit(call: dict, a_: dict, actor: str, reason: str) -> None:
+    if a_.get("cancelled"):
+        return
+    a_["cancelled"], a_["approval"], a_["cancel_reason"] = True, "cancelled", reason
+    if a_.get("unit"):
+        cad_store()["used_units"].discard(a_["unit"])
+    add_event(call, "🛑", f"{a_.get('unit') or a_['dept']} cancelled by {actor}: {reason}", etype="Unit cancelled",
+              actor=actor, unit=a_.get("unit"))
+
+
+def unit_state(a_: dict) -> tuple[str, str]:
+    """Display status of a unit row and its colour key."""
+    if a_.get("cancelled"):
+        return "Cancelled", "muted"
+    if a_.get("approval") == "awaiting":
+        return "Awaiting approval", "amber"
+    if not a_.get("unit") and not a_.get("ticket"):
+        return "Recommended", "gray"
+    if a_.get("released") or a_.get("atr") or a_.get("at_hospital"):
+        return "Completed", "done"
+    if not a_.get("unit"):
+        return "Dispatched", "blue"
+    if a_.get("transport_at"):
+        return "Transporting", "orange"
+    if a_.get("arrived"):
+        return "On scene", "green"
+    if a_.get("sent_at") and time.time() - a_["sent_at"] < 3:
+        return "Dispatched", "blue"
+    return ("En route", "blue") if a_.get("sent_at") else ("Recommended", "gray")
+
+
 def cad_dispatch(call: dict, hindi: bool) -> list[str]:
     """Send whatever the run card needs and is not yet assigned. Returns what to tell the caller."""
     sl, level = call["slots"], response_level(call)
@@ -1835,17 +1965,30 @@ def cad_dispatch(call: dict, hindi: bool) -> list[str]:
     teams = [{"dept": c["dept"], "role": "lead" if not call["assignments"] and k == 0 else "support", "why": c["why"]}
              for k, c in enumerate(need)]
     sent = dispatch_departments(teams, sl.get("location"), call["ref"])
-    for a_ in sent:
-        a_["sent_at"], a_["speed"] = time.time(), cfg()["speed"]
-        radio(call, a_, level)
     first = not call["assignments"]
+    if first:
+        add_event(call, "🗂️", f"Incident created: CFS {call['ref']}, {incident_label(call)}, {LEVELS[level][0]}", etype="Incident created")
+    mode = cad_store().get("approval", "auto")             # a control-room policy, the same for every session
+    for a_ in sent:
+        a_["speed"], a_["recommended_at"] = cfg()["speed"], time.time()
+        add_event(call, "📡", f"{a_.get('unit') or a_.get('ticket') or a_['dept']} recommended ({a_['dept']}): {a_.get('why', '')}",
+                  etype="Unit recommended", unit=a_.get("unit") or a_.get("ticket"))
+        if mode == "auto":
+            approve_unit(call, a_, "Auto-approval (DEMO setting)")
+            a_["announced"] = True                       # the caller is told in this same reply
+        else:
+            a_["approval"] = "awaiting"
     call["assignments"] += sent
     st.session_state.setdefault("dept_jobs", []).extend(
         {**{k: v for k, v in a_.items() if k != "route"}, "problem": ", ".join(PROBLEMS[p]["label"] for p in sl.get("problems", [])) or "unclear",
          "location": sl.get("location"), "severity": call["severity"]} for a_ in sent)
-    add_event(call, "🚨" if first else "➕", ("Dispatched (" if first else "Also sent (") + LEVELS[level][0] + "): "
-              + ", ".join(f"{a_.get('unit') or a_.get('ticket') or a_['dept']}" for a_ in sent))
     names = ", ".join(dict.fromkeys(a_["dept"] for a_ in sent))
+    if mode != "auto":
+        out.append(("आपकी रिपोर्ट ड्यूटी डिस्पैचर को भेज दी गई है, जो नज़दीकी टीम तय कर रहे हैं। टीम रवाना होते ही मैं आपको बताऊँगा।"
+                    if hindi else "Your report is with the duty dispatcher, who is assigning the nearest units now. "
+                                  "I will tell you the moment they are dispatched.") if first else
+                   ("मैंने डिस्पैचर से {t} भी जोड़ने को कहा है।" if hindi else "I have asked the dispatcher to add {t} as well.").format(t=names))
+        return out
     units = sorted([a_ for a_ in sent if a_.get("unit")], key=lambda a_: a_["eta"])
     if first and units:
         out.append(_l(SAY["sending"], hindi).format(teams=names, unit=units[0]["unit"], eta=max(1, round(units[0]["eta"]))))
@@ -1861,9 +2004,20 @@ def check_arrivals(call: dict) -> bool:
     them. The call-taker never hangs up on a silent caller (unless "Hand over automatically" is chosen): it checks on them."""
     ensure_place(call)
     changed, now, c = False, time.time(), cfg()
-    units = [a_ for a_ in call.get("assignments", []) if a_.get("unit")]
+    fresh = [a_ for a_ in call.get("assignments", []) if a_.get("approval") == "approved" and not a_.get("announced")]
+    if fresh:
+        for a_ in fresh:
+            a_["announced"] = True
+        if not call.get("ended"):
+            mov = sorted([a_ for a_ in fresh if a_.get("unit")], key=lambda a_: a_["eta"])
+            names = ", ".join(dict.fromkeys(a_["dept"] for a_ in fresh))
+            agent_say(call, (f"डिस्पैच की पुष्टि हो गई: {names}।" + (f" {mov[0]['unit']} लगभग {max(1, round(mov[0]['eta']))} मिनट में पहुँचेगी।" if mov else ""))
+                      if call["hindi"] else
+                      (f"Dispatch confirmed: {names}." + (f" {mov[0]['unit']} is about {max(1, round(mov[0]['eta']))} minutes away." if mov else "")))
+        changed = True
+    units = [a_ for a_ in call.get("assignments", []) if a_.get("unit") and not a_.get("cancelled")]
     for a_ in units:
-        if not a_.get("arrived") and unit_left(a_, now) <= 0:
+        if a_.get("sent_at") and not a_.get("arrived") and unit_left(a_, now) <= 0:
             a_["arrived"], changed = True, True
             add_event(call, a_["icon"], f"{a_['unit']} ({a_['dept']}) arrived")
             if call["ended"]:
@@ -2342,6 +2496,11 @@ def incident_card_html(c_: dict) -> str:
     if not c_["assignments"]:
         html.append("<div class='v muted'>Help is sent as soon as the call-taker knows what happened and where.</div>")
     for a_ in c_["assignments"]:
+        if a_.get("approval") == "awaiting" or a_.get("cancelled"):
+            st_ = "awaiting dispatcher approval" if a_.get("approval") == "awaiting" else "cancelled"
+            html.append(f"<div class='unit'><div class='top'>{a_['icon']} <b>{a_['dept']}</b> <span style='opacity:.7'>"
+                        f"{a_.get('unit') or a_.get('ticket') or ''}</span><span class='eta' style='font-weight:600;opacity:.8'>{st_}</span></div></div>")
+            continue
         if a_.get("unit"):
             left = unit_left(a_, now)
             frac = 1 - left / a_["eta"] if a_["eta"] else 1
@@ -3031,11 +3190,471 @@ if "calls" not in st.session_state:
     st.session_state.calls = []
 if "dispatches" not in st.session_state:
     st.session_state.dispatches = []
-if "used_vehicle_ids" not in st.session_state:
-    st.session_state.used_vehicle_ids = set()
 
-tab_call, tab_dept, tab_acc, tab2 = st.tabs(["📞 Emergency call", "🏢 Departments & agents", "📊 Accuracy & observability",
-                                            "🚑 Dispatch board"])
+# ======================= COMMAND CENTER: reusable components (business logic stays in the CAD functions above) =======================
+APP_ENV = (_secret("APP_ENV") or "DEMO").upper()
+PRIO_STYLE = {   # internal level -> (short label, icon, css colour key)
+    "E": ("P1", "▲▲", "red"), "D": ("P1", "▲▲", "red"), "C": ("P2", "▲", "orange"), "B": ("P3", "■", "amber"),
+    "A": ("P3", "■", "green"), "O": ("P4", "●", "blue"),
+}
+
+
+def cc_css(p: dict) -> str:
+    dark = p["theme"] == "Dark"
+    base = 15 if p["large_text"] else 13.5
+    pad = "8px 10px" if p["density"] == "Compact" else "12px 14px"
+    v = {"bg": "#0f141a" if dark else "#f4f6f9", "panel": "#161d26" if dark else "#ffffff", "border": "#2a3542" if dark else "#d6dde6",
+         "text": "#eef2f6" if dark else "#14202c", "muted": "#9aa8b6" if dark else "#5b6b7a"}
+    if p["high_contrast"]:
+        v.update(border="#8796a8" if dark else "#3a4655", muted="#d0d8e2" if dark else "#2c3844")
+    return f"""<style>
+:root{{--cc-bg:{v['bg']};--cc-panel:{v['panel']};--cc-border:{v['border']};--cc-text:{v['text']};--cc-muted:{v['muted']};
+--red:#e5484d;--orange:#f0883e;--amber:#e2b33c;--green:#3fb87f;--blue:#4c8ff0;--gray:#8b98a7;--done:#5f9f7d;--muted:#6f7c89}}
+{'.stApp{background:var(--cc-bg)}' if p['theme'] == 'Light' else ''}
+.cc *{{box-sizing:border-box}}
+.cc{{color:var(--cc-text);font-size:{base}px}}
+.cc .panel{{background:var(--cc-panel);border:1px solid var(--cc-border);border-radius:12px;padding:{pad};margin-bottom:10px}}
+.cc .muted{{color:var(--cc-muted)}}
+.cc-top{{display:flex;align-items:center;gap:14px;flex-wrap:wrap;background:var(--cc-panel);border:1px solid var(--cc-border);
+  border-radius:12px;padding:10px 14px}}
+.cc-top .brand{{font-weight:800;font-size:1.05rem;letter-spacing:.02em}}
+.cc-top .env{{font-size:.72rem;font-weight:800;border-radius:6px;padding:2px 8px;border:1px solid var(--amber);color:var(--amber)}}
+.cc-top .clock{{font-variant-numeric:tabular-nums;font-weight:700}}
+.cc-top .st{{font-size:.8rem;color:var(--cc-muted)}}.cc-top .st b{{color:var(--cc-text)}}
+.cc-top .sp{{margin-left:auto}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}}
+.badge{{display:inline-flex;align-items:center;gap:4px;font-size:.74rem;font-weight:800;border-radius:6px;padding:2px 7px;
+  border:1px solid currentColor;white-space:nowrap}}
+.c-red{{color:var(--red)}}.c-orange{{color:var(--orange)}}.c-amber{{color:var(--amber)}}.c-green{{color:var(--green)}}
+.c-blue{{color:var(--blue)}}.c-gray{{color:var(--gray)}}.c-done{{color:var(--done)}}.c-muted{{color:var(--muted)}}
+.kv{{display:grid;grid-template-columns:150px 1fr;gap:6px 12px;font-size:.88em}}.kv span:nth-child(odd){{color:var(--cc-muted)}}
+.cad-h{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}.cad-h .id{{font-weight:800;font-size:1.05em}}
+.cad-h .cts{{margin-left:auto;color:var(--cc-muted);font-size:.82em}}
+.sec{{font-size:.72rem;text-transform:uppercase;letter-spacing:.06em;color:var(--cc-muted);margin:12px 0 6px;font-weight:700}}
+table.ut{{width:100%;border-collapse:collapse;font-size:.84em}}
+table.ut th{{text-align:left;color:var(--cc-muted);font-weight:600;font-size:.86em;border-bottom:1px solid var(--cc-border);padding:5px 6px}}
+table.ut td{{border-bottom:1px solid var(--cc-border);padding:6px;vertical-align:top}}
+.tl2{{position:relative;margin-left:6px}}
+.ev{{display:grid;grid-template-columns:{'86px' if p['clock'] == '12-hour' else '64px'} 22px 1fr;gap:8px;padding:{'3px' if p['timeline'] == 'Compact' else '6px'} 0;
+  border-bottom:1px solid var(--cc-border);font-size:.86em}}
+.ev time{{color:var(--cc-muted);font-variant-numeric:tabular-nums}}.ev .t{{font-weight:700}}.ev .a{{color:var(--cc-muted);font-size:.9em}}
+.ev details summary{{cursor:pointer;color:var(--cc-muted);font-size:.85em}}
+.ag{{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}}
+.ag .panel{{margin:0}}.ag .lead{{border-color:var(--blue)}}
+{'.cc *{animation:none !important;transition:none !important}' if p['reduce_motion'] else ''}
+[class*="st-key-kpi_"] button{{min-height:84px;height:84px;border-radius:12px;text-align:left;justify-content:flex-start;background:var(--cc-panel);
+  border:1px solid var(--cc-border)}}
+[class*="st-key-kpi_"] button p{{font-size:.82rem;line-height:1.25;white-space:pre-line;text-align:left}}
+[class*="st-key-kpi_"] button strong{{font-size:1.6rem;display:block}}
+</style>"""
+
+
+def prio_badge(level: str | None) -> str:
+    if not level:
+        return "<span class='badge c-gray'>● Pending</span>"
+    lab, ic, col = PRIO_STYLE[level]
+    return f"<span class='badge c-{col}' title='{LEVELS[level][1]}'>{ic} {lab} · {LEVELS[level][0].split('·')[-1].strip()}</span>"
+
+
+def status_badge(label: str, col: str) -> str:
+    icon = {"red": "⚠", "orange": "➜", "amber": "⏳", "green": "●", "blue": "➜", "gray": "○", "done": "✔", "muted": "✕"}.get(col, "●")
+    return f"<span class='badge c-{col}'>{icon} {label}</span>"
+
+
+def incident_status(c_: dict) -> tuple[str, str]:
+    sl, units = c_["slots"], [a_ for a_ in c_.get("assignments", []) if not a_.get("cancelled")]
+    if c_.get("certainty") in ("question", "hypothetical") and not c_.get("dispatched"):
+        return "Information only", "gray"
+    if not sl.get("location") or not sl.get("problems"):
+        return "Intake", "gray"
+    if not sl.get("location_ok"):
+        return "Verifying location", "amber"
+    if not units:
+        return "Awaiting assignment", "amber"
+    states = [unit_state(a_)[0] for a_ in units]
+    if "Awaiting approval" in states:
+        return "Awaiting approval", "amber"
+    if any(x in ("En route", "Dispatched") for x in states):
+        return "Units en route", "blue"
+    if any(x in ("On scene", "Transporting") for x in states):
+        return "On scene", "green"
+    if all(x == "Completed" for x in states):
+        return "Completed", "done"
+    return "Active", "blue"
+
+
+def esc(x) -> str:
+    import html as _h
+    return _h.escape(str(x if x is not None else ""))
+
+
+def all_incidents() -> list[dict]:
+    """Every incident on this server, newest first (from real application data only)."""
+    return sorted(cad_store()["incidents"].values(), key=lambda c_: c_.get("created", 0), reverse=True)
+
+
+def kpis(incs: list[dict]) -> dict:
+    active = [c_ for c_ in incs if incident_status(c_)[0] not in ("Completed", "Information only")]
+    units = [a_ for c_ in incs for a_ in c_.get("assignments", []) if a_.get("unit") and not a_.get("cancelled")]
+    moving = [a_ for a_ in units if unit_state(a_)[0] in ("Dispatched", "En route", "On scene", "Transporting")]
+    resp = [(a_["arrived_at"] - a_["sent_at"]) / a_.get("speed", sim_seconds) for a_ in units if a_.get("arrived_at") and a_.get("sent_at")]
+    return {"Active incidents": len(active),
+            "P1 critical": sum(1 for c_ in active if c_.get("level") in ("D", "E")),
+            "P2 urgent": sum(1 for c_ in active if c_.get("level") == "C"),
+            "Units available": sum(1 for v in VEHICLES if v["Vehicle ID"] not in cad_store()["used_units"]),
+            "Units dispatched": len(moving),
+            "Awaiting assignment": sum(1 for c_ in active if incident_status(c_)[0] in ("Verifying location", "Awaiting assignment",
+                                                                                       "Awaiting approval", "Intake")),
+            "Average response": (f"{sum(resp) / len(resp):.1f} min" if resp else "—")}
+
+
+def describe(c_: dict) -> str:
+    """A plain description built only from what the caller said (no invented details)."""
+    sl = c_["slots"]
+    bits = [incident_label(c_)]
+    if sl.get("location"):
+        bits.append(f"at {sl['location']}")
+    if sl.get("people"):
+        bits.append(f"{sl['people']} {'person' if sl['people'] == 1 else 'people'} affected")
+    danger = [lbl for key, val, lbl in [("breathing", False, "not breathing"), ("trapped", True, "trapped"), ("bleeding", True, "heavy bleeding"),
+                                        ("spreading", True, "spreading"), ("weapon", True, "weapon reported")] if sl.get(key) is val]
+    if danger:
+        bits.append("danger: " + ", ".join(danger))
+    return "; ".join(bits) + "."
+
+
+def cad_card_html(c_: dict) -> str:
+    sl = c_["slots"]
+    stt, col = incident_status(c_)
+    geo_state = {"one": "Found on map", "many": "Several map matches", "none": "Not found on map",
+                 "unavailable": "Map service unavailable"}.get(sl.get("geo_state"), "Not checked")
+    verified = ("Verified (caller confirmed" + (" + map match)" if sl.get("geo") else ", not on map)")) if sl.get("location_ok") else "Not verified"
+    missing = [n for n, ok in [("location confirmation", sl.get("location_ok")), ("what happened", sl.get("problems")),
+                               ("number of people", sl.get("people")), ("caller name", sl.get("name"))] if not ok]
+    conf = ("AI (Groq) classification: no numeric confidence" if c_.get("ai_label") else "Keyword rules: confidence not measured")
+    rows = []
+    for a_ in c_.get("assignments", []):
+        lab, ucol = unit_state(a_)
+        fleet = DEPARTMENTS[a_["dept"]]["fleet"] or "Helpline ticket"
+        rows.append(f"<tr><td>{a_['icon']} {esc(AGENCY.get(a_['dept'], a_['dept']))}</td><td><b>{esc(a_.get('unit') or a_.get('ticket') or '—')}</b></td>"
+                    f"<td>{esc(fleet)}</td><td>{esc(a_.get('why', ''))}</td>"
+                    f"<td>{ist_time(a_['sent_at']) if a_.get('sent_at') else '—'}</td>"
+                    f"<td>{(str(max(1, math.ceil(unit_left(a_)))) + ' min (simulated)') if a_.get('sent_at') and not a_.get('arrived') else '—'}</td>"
+                    f"<td>{ist_time(a_['arrived_at']) if a_.get('arrived_at') else '—'}</td>"
+                    f"<td>{status_badge(lab, ucol)}</td><td class='muted'>{esc(a_.get('approved_by') or ('pending' if a_.get('approval') == 'awaiting' else '—'))}</td></tr>")
+    units_tbl = ("<table class='ut'><tr><th>Agency</th><th>Unit</th><th>Type</th><th>Task / reason</th><th>Dispatched</th><th>ETA</th>"
+                 "<th>Arrived</th><th>Status</th><th>Approved by</th></tr>" + "".join(rows) + "</table>") if rows else \
+        "<div class='muted'>No units yet: the CAD recommends units once the location is confirmed.</div>"
+    return (f"<div class='cc'><div class='panel'><div class='cad-h'><span class='id'>CFS {esc(c_['ref'])}</span>"
+            f"<span>{esc(incident_label(c_))}</span>{prio_badge(c_.get('level'))}{status_badge(stt, col)}"
+            f"<span class='cts'>Created {ist_stamp(c_.get('created', c_['started']))}</span></div>"
+            "<div class='sec'>Incident summary</div><div class='kv'>"
+            f"<span>Description</span><span>{esc(describe(c_))}</span>"
+            f"<span>Caller's words</span><span>“{esc(c_.get('original', ''))}”</span>"
+            f"<span>Location</span><span>{esc(sl.get('location') or 'not given')}{(' → ' + esc(sl['geo']['name'])) if sl.get('geo') else ''}</span>"
+            f"<span>Location status</span><span>{verified} · {geo_state}</span>"
+            f"<span>Certainty</span><span>{esc({'reported': 'Reported by caller', 'suspected': 'Suspected, not confirmed', 'question': 'Question, not a report', 'hypothetical': 'Hypothetical'}.get(c_.get('certainty'), '—'))}</span>"
+            f"<span>Classification</span><span>{conf}</span>"
+            f"<span>Needs attention</span><span>{esc(', '.join(missing) or 'nothing critical')}{(' · escalated: ' + esc('; '.join(c_['escalated']))) if c_.get('escalated') else ''}</span>"
+            f"<span>Caller</span><span>{esc(sl.get('name') or 'not given')} · {('••••• ' + sl['phone'][-4:]) if sl.get('phone') and sl['phone'] != 'not given' else 'no number'}</span>"
+            "</div><div class='sec'>Dispatch recommendation and units</div>" + units_tbl +
+            "<div class='muted' style='font-size:.78em;margin-top:6px'>Travel times are from the simulated demo road grid, not live traffic. "
+            "AI classification is not proof that an allegation is true.</div></div></div>")
+
+
+def timeline_html(c_: dict, p: dict) -> str:
+    ev = sorted(c_.get("audit", []), key=lambda e: (e["ts"], e["id"]))
+    rows = []
+    for e in ev:
+        det = (f"<details><summary>details</summary><div class='muted'>Event {esc(e['id'])} · {ist_stamp(e['ts'])} · "
+               f"{esc(e.get('details') or e['text'])}</div></details>" if p["timeline"] == "Detailed" else "")
+        stt = f" {status_badge(e['status'], {'Dispatched': 'blue', 'On scene': 'green', 'Transporting': 'orange', 'Completed': 'done', 'Cancelled': 'muted', 'Recommended': 'gray', 'Approved': 'blue', 'Verified': 'green', 'Closed': 'done', 'Attention': 'red'}.get(e['status'], 'gray'))}" if e.get("status") else ""
+        rows.append(f"<div class='ev'><time>{ist_time(e['ts'])}</time><span>{e['icon']}</span><div><span class='t'>{esc(e['type'])}</span>{stt}"
+                    f"{(' · <b>' + esc(e['unit']) + '</b>') if e.get('unit') else ''}<div>{esc(e['text'])}</div>"
+                    f"<div class='a'>by {esc(e['actor'])}</div>{det}</div></div>")
+    return "<div class='cc'><div class='panel tl2'>" + ("".join(rows) or "<div class='muted'>No events yet.</div>") + "</div></div>"
+
+
+def agencies_html(c_: dict, p: dict) -> str:
+    by = {}
+    for a_ in c_.get("assignments", []):
+        if a_["dept"] in p["agencies"]:
+            by.setdefault(a_["dept"], []).append(a_)
+    if not by:
+        return "<div class='cc'><div class='panel muted'>No agencies involved yet.</div></div>"
+    cards = []
+    for d, units in by.items():
+        lead = any(a_.get("role") == "lead" for a_ in units)
+        rows = "".join(f"<div style='margin-top:6px'><b>{esc(a_.get('unit') or a_.get('ticket') or '—')}</b> · {esc(a_.get('why', ''))}<br>"
+                       f"{status_badge(*unit_state(a_))}</div>" for a_ in units)
+        cards.append(f"<div class='panel {'lead' if lead else ''}'><div><b>{DEPARTMENTS[d]['icon']} {esc(d)}</b> "
+                     f"<span class='badge {'c-blue' if lead else 'c-gray'}'>{'Lead agency' if lead else 'Supporting'}</span></div>"
+                     f"<div class='muted' style='font-size:.8em'>{esc(DEPARTMENTS[d]['agency'])} · ☎ {esc(DEPARTMENTS[d]['lines'])}</div>{rows}</div>")
+    return "<div class='cc'><div class='ag'>" + "".join(cards) + "</div></div>"
+
+
+def india_map(incs: list[dict], selected: str | None, p: dict, center=None):
+    """Interactive India map: verified incident locations only (unit GPS is not available in this demo)."""
+    tiles = {"Dark": "CartoDB dark_matter", "Light": "CartoDB positron", "Street": "OpenStreetMap"}
+    sel = next((c_ for c_ in incs if c_["ref"] == selected), None)
+    if center is None and sel and sel["slots"].get("geo") and sel["slots"].get("location_ok"):
+        center = (sel["slots"]["geo"]["lat"], sel["slots"]["geo"]["lon"])
+    m = folium.Map(location=center or (22.6, 79.0), zoom_start=13 if center else p["zoom"], tiles=None, control_scale=True,
+                   max_bounds=True, min_lat=5, max_lat=38, min_lon=66, max_lon=99)
+    for name, t in tiles.items():
+        folium.TileLayer(t, name=f"Base map: {name}", show=(name == p["tiles"])).add_to(m)
+    fg = folium.FeatureGroup(name="Incidents", show="Incidents" in p["layers"])
+    colours = {"red": "#e5484d", "orange": "#f0883e", "amber": "#e2b33c", "green": "#3fb87f", "blue": "#4c8ff0"}
+    for c_ in incs:
+        g = c_["slots"].get("geo")
+        if not (g and c_["slots"].get("location_ok")):
+            continue                                    # only verified locations go on the CAD map
+        lab, ic, col = PRIO_STYLE.get(c_.get("level") or "B")
+        tip = f"{c_['ref']} · {lab} · {incident_label(c_)}"
+        folium.CircleMarker((g["lat"], g["lon"]), radius=14 if c_["ref"] == selected else 9, color="#ffffff" if c_["ref"] == selected else colours[col],
+                            weight=3 if c_["ref"] == selected else 1.5, fill=True, fill_color=colours[col], fill_opacity=.85,
+                            tooltip=tip, popup=folium.Popup(f"<b>{esc(c_['ref'])}</b><br>{esc(incident_label(c_))}<br>{lab} · "
+                                                            f"{esc(incident_status(c_)[0])}<br>{esc(g['name'][:90])}", max_width=260)).add_to(fg)
+    fg.add_to(m)
+    folium.FeatureGroup(name="Response units (needs live GPS / AVL)", show=False).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
+    return m
+
+
+def beep_wav() -> bytes:
+    import numpy as np
+    t = np.linspace(0, .35, int(16000 * .35), endpoint=False)
+    tone = (0.25 * np.sin(2 * np.pi * 880 * t) * (t < .15) + 0.25 * np.sin(2 * np.pi * 660 * t) * (t >= .2)) * 32767
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000); w.writeframes(tone.astype("<i2").tobytes())
+    return buf.getvalue()
+
+
+def settings_panel(p: dict) -> None:
+    st.markdown("**Dashboard settings**")
+    c1, c2 = st.columns(2)
+    p["theme"] = c1.radio("Theme", ["Dark", "Light"], index=["Dark", "Light"].index(p["theme"]), horizontal=True, key="cc_theme")
+    p["density"] = c2.radio("Layout", ["Comfortable", "Compact"], index=["Comfortable", "Compact"].index(p["density"]), horizontal=True, key="cc_density")
+    p["clock"] = c1.radio("Time format", ["12-hour", "24-hour"], index=["12-hour", "24-hour"].index(p["clock"]), horizontal=True, key="cc_clock")
+    p["timeline"] = c2.radio("Timeline", ["Detailed", "Compact"], index=["Detailed", "Compact"].index(p["timeline"]), horizontal=True, key="cc_tl")
+    p["sections"] = st.multiselect("Sections shown", CC_DEFAULTS["sections"], default=p["sections"], key="cc_sections")
+    p["cards"] = st.multiselect("Overview cards", CC_DEFAULTS["cards"], default=p["cards"], key="cc_cards")
+    p["columns"] = st.multiselect("Queue columns", CC_DEFAULTS["columns"], default=p["columns"], key="cc_cols")
+    p["agencies"] = st.multiselect("Agencies shown", list(DEPARTMENTS), default=p["agencies"], key="cc_ag")
+    c3, c4 = st.columns(2)
+    p["zoom"] = c3.slider("Default map zoom", 4, 12, int(p["zoom"]), key="cc_zoom")
+    p["tiles"] = c4.selectbox("Base map", ["Dark", "Light", "Street"], index=["Dark", "Light", "Street"].index(p["tiles"]), key="cc_tiles")
+    p["layers"] = st.multiselect("Map layers", ["Incidents"], default=p["layers"], key="cc_layers")
+    p["refresh"] = st.select_slider("Refresh every (seconds)", [2, 3, 5, 10, 30], value=p["refresh"], key="cc_refresh")
+    store_ = cad_store()
+    store_["approval"] = st.radio("Dispatch approval (control-room policy, applies to every call)", ["auto", "required"],
+                                  index=["auto", "required"].index(store_.get("approval", "auto")),
+                                  format_func=lambda x: {"auto": "Auto-approve (DEMO only)", "required": "Dispatcher must approve"}[x],
+                                  horizontal=True, key="cc_approval")
+    c5, c6, c7 = st.columns(3)
+    p["sound"] = c5.toggle("Sound on new P1", value=p["sound"], key="cc_sound")
+    p["large_text"] = c6.toggle("Larger text", value=p["large_text"], key="cc_large")
+    p["high_contrast"] = c7.toggle("High contrast", value=p["high_contrast"], key="cc_hc")
+    p["reduce_motion"] = c5.toggle("Reduce motion", value=p["reduce_motion"], key="cc_rm")
+    p["profile"] = st.text_input("Dispatcher name", value=p["profile"], key="cc_profile")
+    p["role"] = st.selectbox("Role", ["Dispatch Officer", "Communication Officer", "Shift Supervisor"],
+                             index=["Dispatch Officer", "Communication Officer", "Shift Supervisor"].index(p["role"]), key="cc_role")
+    if st.button("Save as my defaults", key="cc_save"):
+        cad_store()["prefs"][p["profile"]] = dict(p)
+        st.success("Saved on this server for this dispatcher name (until the app restarts).")
+    st.caption("Theme applies to the Command Center panels; Streamlit's own controls follow the app theme (⋮ menu → Settings).")
+
+
+st.session_state.used_vehicle_ids = cad_store()["used_units"]     # one fleet for every session
+
+tab_cc, tab_call, tab_dept, tab_acc, tab2 = st.tabs(["🖥️ Command Center", "📞 Emergency call", "🏢 Departments & agents",
+                                                    "📊 Accuracy & observability", "🚑 Dispatch board"])
+
+
+with tab_cc:
+    P_ = cc_prefs()
+    st.markdown(cc_css(P_), unsafe_allow_html=True)
+    pin = _secret("DISPATCHER_PIN")
+    if pin and not st.session_state.get("cc_auth"):
+        st.markdown("#### 🔒 Dispatcher sign-in")
+        entered = st.text_input("Dispatcher PIN", type="password", key="cc_pin")
+        if st.button("Sign in", key="cc_signin"):
+            if entered == pin:
+                st.session_state.cc_auth = True
+                st.rerun()
+            st.error("Wrong PIN.")
+    else:
+        incs_now = all_incidents()
+        awaiting = sum(1 for c_ in incs_now for a_ in c_.get("assignments", []) if a_.get("approval") == "awaiting")
+        escal = [c_ for c_ in incs_now if c_.get("escalated") and incident_status(c_)[0] != "Completed"]
+
+        t1, t2, t3 = st.columns([6, 1.1, 1.1])
+        with t1:
+            @st.fragment(run_every=1.0)
+            def top_bar() -> None:
+                st.markdown(
+                    "<div class='cc'><div class='cc-top'><span class='brand'>ERSS-112 CAD</span>"
+                    f"<span class='env'>{esc(APP_ENV)}</span><span class='clock'>🕒 {ist_stamp()}</span>"
+                    "<span class='st'><span class='dot' style='background:var(--amber)'></span>Control room link: <b>simulated</b></span>"
+                    f"<span class='st'>AI: <b>{'Groq' if use_groq else 'rules'}</b> · Tracing: <b>{'on' if ls_client else 'off'}</b></span>"
+                    f"<span class='st sp'>👤 <b>{esc(P_['profile'])}</b> · {esc(P_['role'])}</span></div></div>", unsafe_allow_html=True)
+            top_bar()
+        with t2.popover(f"🔔 {awaiting + len(escal)}"):
+            st.markdown("**Notifications**")
+            for c_ in incs_now:
+                for a_ in c_.get("assignments", []):
+                    if a_.get("approval") == "awaiting":
+                        st.markdown(f"⏳ **{c_['ref']}**: {a_.get('unit') or a_['dept']} awaiting approval")
+            for c_ in escal:
+                st.markdown(f"⚠️ **{c_['ref']}**: {'; '.join(c_['escalated'])}")
+            if not awaiting and not escal:
+                st.caption("Nothing needs attention.")
+        with t3.popover("⚙️ Settings"):
+            settings_panel(P_)
+        if not pin:
+            st.caption(f"{APP_ENV} mode: open access. Set DISPATCHER_PIN in Secrets to restrict this page to dispatchers. "
+                       "All incidents come from calls made in this app; nothing is invented.")
+
+        @st.fragment(run_every=float(P_["refresh"]))
+        def live_board() -> None:
+            p = cc_prefs()
+            incs = all_incidents()
+            for c_ in incs:                                  # keep every open incident moving, even if its caller has left
+                if c_.get("phase") == "connected":
+                    check_arrivals(c_)
+            if p["sound"]:
+                seen = st.session_state.setdefault("cc_seen_p1", set())
+                new_p1 = [c_["ref"] for c_ in incs if c_.get("level") in ("D", "E") and c_["ref"] not in seen]
+                if new_p1:
+                    seen.update(new_p1)
+                    st.audio(beep_wav(), format="audio/wav", autoplay=True)
+            k = kpis(incs)
+            if "Overview" in p["sections"] and p["cards"]:
+                cols = st.columns(len(p["cards"]))
+                for col, name in zip(cols, p["cards"]):
+                    flt = st.session_state.get("cc_filter")
+                    if col.button(f"**{k[name]}**\n{name}" + (" ✓" if flt == name else ""), key=f"kpi_{name.replace(' ', '_')}",
+                                  width="stretch", help="Filter the incident queue"):
+                        st.session_state.cc_filter = None if flt == name else name
+                        st.rerun(scope="fragment")
+            if "Queue" in p["sections"]:
+                f1, f2, f3, f4 = st.columns([2.2, 1.3, 1.3, 1.2])
+                q = f1.text_input("Search", placeholder="ID, incident, place, unit…", key="cc_q", label_visibility="collapsed")
+                fp = f2.multiselect("Priority", ["P1", "P2", "P3", "P4"], key="cc_fp", placeholder="Priority", label_visibility="collapsed")
+                fs = f3.multiselect("Status", ["Intake", "Verifying location", "Awaiting assignment", "Awaiting approval", "Units en route",
+                                               "On scene", "Completed", "Information only"], key="cc_fs", placeholder="Status",
+                                    label_visibility="collapsed")
+                srt = f4.selectbox("Sort", ["Newest", "Priority", "Status"], key="cc_sort", label_visibility="collapsed")
+                rows = []
+                for c_ in incs:
+                    stt = incident_status(c_)[0]
+                    lab = PRIO_STYLE[c_["level"]][0] if c_.get("level") else "—"
+                    units_ = ", ".join(a_.get("unit") or a_.get("ticket") or a_["dept"] for a_ in c_.get("assignments", []) if not a_.get("cancelled"))
+                    rows.append({"ID": c_["ref"], "Incident": incident_label(c_), "Priority": lab,
+                                 "Location": (c_["slots"].get("location") or "—") + ("" if c_["slots"].get("location_ok") else " (unverified)"),
+                                 "Received": ist_time(c_.get("created", c_["started"])), "Status": stt, "Assigned": units_ or "—",
+                                 "_lvl": "EDCBAO".index(c_["level"]) if c_.get("level") else 9, "_t": c_.get("created", 0)})
+                flt = st.session_state.get("cc_filter")
+                rows = [r for r in rows if (not q or q.lower() in " ".join(str(v) for v in r.values()).lower())
+                        and (not fp or r["Priority"] in fp) and (not fs or r["Status"] in fs)
+                        and (flt in (None, "Active incidents", "Units available", "Average response")
+                             or (flt == "P1 critical" and r["Priority"] == "P1") or (flt == "P2 urgent" and r["Priority"] == "P2")
+                             or (flt == "Units dispatched" and r["Status"] in ("Units en route", "On scene"))
+                             or (flt == "Awaiting assignment" and r["Status"] in ("Verifying location", "Awaiting assignment", "Awaiting approval", "Intake")))
+                        and (flt != "Active incidents" or r["Status"] not in ("Completed", "Information only"))]
+                rows.sort(key=lambda r: (r["_lvl"], -r["_t"]) if srt == "Priority" else (r["Status"], -r["_t"]) if srt == "Status" else (-r["_t"],))
+                if rows:
+                    df_ = pd.DataFrame(rows)[[c for c in p["columns"] if c in rows[0]]]
+                    ev_ = st.dataframe(df_, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+                                       key="cc_queue", height=min(38 * (len(df_) + 1) + 4, 300))
+                    sel_rows = ev_.selection.rows if ev_ and hasattr(ev_, "selection") else []
+                    if sel_rows:
+                        new_sel = df_.iloc[sel_rows[0]]["ID"] if "ID" in df_ else rows[sel_rows[0]]["ID"]
+                        if new_sel != st.session_state.get("cc_sel"):
+                            st.session_state.cc_sel = new_sel
+                            st.rerun(scope="app")                # keep the map and details in step
+                    if not st.session_state.get("cc_sel"):
+                        st.session_state.cc_sel = rows[0]["ID"]
+                else:
+                    st.info("No incidents match. Incidents appear here when someone makes an 📞 Emergency call.")
+
+            sel = next((c_ for c_ in incs if c_["ref"] == st.session_state.get("cc_sel")), None)
+            if sel is None:
+                return
+            if "CAD decision" in p["sections"]:
+                with st.expander(f"CAD decision · CFS {sel['ref']}", expanded=True):
+                    st.markdown(cad_card_html(sel), unsafe_allow_html=True)
+                    pend = [a_ for a_ in sel.get("assignments", []) if a_.get("approval") == "awaiting"]
+                    act = [a_ for a_ in sel.get("assignments", []) if not a_.get("cancelled") and unit_state(a_)[0] not in ("Completed",)]
+                    b1, b2, b3 = st.columns([1.2, 1.6, 1.2])
+                    who = f"{p['profile']} ({p['role']})"
+                    if pend and b1.button(f"✅ Approve all ({len(pend)})", type="primary", key=f"appr_{sel['ref']}", width="stretch"):
+                        for a_ in pend:
+                            approve_unit(sel, a_, who)
+                        st.rerun(scope="app")
+                    if act:
+                        pick = b2.selectbox("Unit", [a_.get("unit") or a_.get("ticket") or a_["dept"] for a_ in act],
+                                            key=f"pick_{sel['ref']}", label_visibility="collapsed")
+                        tgt = next(a_ for a_ in act if (a_.get("unit") or a_.get("ticket") or a_["dept"]) == pick)
+                        if tgt.get("approval") == "awaiting" and b3.button("Approve unit", key=f"ap1_{sel['ref']}", width="stretch"):
+                            approve_unit(sel, tgt, who)
+                            st.rerun(scope="app")
+                        elif tgt.get("approval") != "awaiting" and b3.button("Cancel unit", key=f"can_{sel['ref']}", width="stretch"):
+                            cancel_unit(sel, tgt, who, "cancelled by the dispatcher")
+                            st.rerun(scope="app")
+            if "Agencies" in p["sections"]:
+                st.markdown("##### Agency coordination")
+                st.markdown(agencies_html(sel, p), unsafe_allow_html=True)
+            if "Timeline" in p["sections"]:
+                st.markdown(f"##### Activity timeline · CFS {sel['ref']}")
+                st.markdown(timeline_html(sel, p), unsafe_allow_html=True)
+
+        left_, right_ = st.columns([1.25, 1], gap="medium") if "Map" in P_["sections"] else (st.container(), None)
+        with left_:
+            live_board()
+        if right_ is not None:
+            with right_:
+                st.markdown("##### India map")
+                incs_m = all_incidents()
+                if folium is None:
+                    st.warning("The map needs the folium and streamlit-folium packages (see requirements.txt).")
+                else:
+                    sel_ref = st.session_state.get("cc_sel")
+                    out_ = st_folium(india_map(incs_m, sel_ref, P_, st.session_state.get("cc_center")), key="cc_map", height=470,
+                                     use_container_width=True, returned_objects=["last_object_clicked_tooltip"])
+                    tip = (out_ or {}).get("last_object_clicked_tooltip")
+                    if tip and tip.split(" · ")[0] != sel_ref and st.session_state.get("cc_last_tip") != tip:
+                        st.session_state.cc_last_tip = tip
+                        st.session_state.cc_sel, st.session_state.cc_center = tip.split(" · ")[0], None
+                        st.rerun()
+                    n_unv = sum(1 for c_ in incs_m if c_["slots"].get("location") and not c_["slots"].get("location_ok"))
+                    st.caption("Only verified locations are shown. " + (f"{n_unv} incident(s) still need location verification. " if n_unv else "")
+                               + "Response units appear only with live GPS / AVL data, which this demo does not have.")
+                st.markdown("##### Find a place")
+                place_q = st.text_input("Search any place in India", placeholder="e.g. India Gate, New Delhi · Sector 62 Noida · Majestic Bengaluru",
+                                        key="cc_place", label_visibility="collapsed")
+                if place_q:
+                    res = geocode_india(place_q.strip())
+                    if res is None:
+                        st.error("The map service could not be reached. Try again, or confirm the place with the caller.")
+                    elif not res:
+                        st.warning("No match in India. Try a nearby landmark, locality, district or state.")
+                    else:
+                        choice = st.radio("Matches", [r_["name"] for r_ in res], key="cc_place_pick", label_visibility="collapsed")
+                        g_ = next(r_ for r_ in res if r_["name"] == choice)
+                        m1, m2 = st.columns(2)
+                        if m1.button("Show on map", key="cc_show", width="stretch"):
+                            st.session_state.cc_center = (g_["lat"], g_["lon"])
+                            st.rerun()
+                        sel_c = cad_store()["incidents"].get(st.session_state.get("cc_sel") or "")
+                        if sel_c and m2.button(f"Set as location of {sel_c['ref']}", key="cc_setloc", width="stretch"):
+                            old = sel_c["slots"].get("location")
+                            sel_c["slots"].update(geo=g_, geo_state="one", location_ok=True, location=sel_c["slots"].get("location") or place_q.strip())
+                            add_event(sel_c, "🧑‍💼", f"Location set by dispatcher: {g_['name']} (caller said: {old or 'nothing'})",
+                                      etype="Location verified", actor=f"{P_['profile']} ({P_['role']})")
+                            st.session_state.cc_center = None
+                            st.rerun()
 
 with tab_call:
     st.markdown(DIALER_CSS, unsafe_allow_html=True)
@@ -3060,7 +3679,8 @@ with tab_call:
             call["slots"]["phone"] = re.sub(r"\D", "", call["ani"])[-10:]       # the system already knows the number (ANI)
             call["slots"]["phone_src"] = "ANI"
             call["phase"], call["started"] = "connected", time.time()
-            call["events"] = [("📞", "Call connected to the 112 response centre", time.time())]
+            call["events"] = []
+            add_event(call, "📞", "Call received at the 112 response centre", etype="Call received", actor="Caller")
             agent_say(call, _l(CALL_Q["problem"], call["hindi"]))
             call["asked"].append("problem")
             st.session_state.call, st.session_state.call_closed_seen = call, False
@@ -3533,7 +4153,7 @@ with tab2:
     if st.button("Reset demo state"):
         st.session_state.calls = []
         st.session_state.dispatches = []
-        st.session_state.used_vehicle_ids = set()
+        st.session_state.used_vehicle_ids.clear()
         st.rerun()
 
 st.divider()
