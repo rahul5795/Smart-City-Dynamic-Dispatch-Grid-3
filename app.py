@@ -51,7 +51,7 @@ CC_DEFAULTS = {
     "reduce_motion": False, "approval": "auto", "profile": "Duty Dispatcher", "role": "Dispatch Officer",
     "sections": ["Overview", "Queue", "Map", "CAD decision", "Agencies", "Timeline"],
     "cards": ["Active incidents", "P1 critical", "P2 urgent", "Units available", "Units dispatched", "Awaiting assignment",
-              "Average response"],
+              "Resolved", "Average response"],
     "columns": ["ID", "Incident", "Priority", "Location", "Received", "Status", "Assigned"],
     "agencies": ["Police", "Fire & Rescue", "Ambulance (EMS)", "Disaster Response", "Gas Emergency", "Electricity Board",
                  "Women Helpline", "Child Helpline"],
@@ -145,8 +145,9 @@ st.title("🚨 Smart City Dynamic Dispatch Grid")
 st.caption("Synthetic emergency-call triage, incident prioritization, and vehicle dispatch demo · "
            f"🇮🇳 all times in IST (UTC+05:30) · {ist_human()}")
 st.warning(
-    "Prototype only: this uses synthetic data and a simplified grid. "
-    "Do not use it to make real emergency-response decisions."
+    "This application is a prototype and uses synthetic data. It is not connected to real emergency services. "
+    "Do not use it to make real emergency-response decisions. Every dispatch, travel time and unit status it shows "
+    "is simulated on a demo road grid."
 )
 
 # ----------------------- City and fleet -----------------------
@@ -3229,10 +3230,15 @@ def ls_extra(tag: str, thread: str) -> dict:
     return {"run_id": uuid.uuid4(), "metadata": {"thread_id": thread, "app": "sahayak-112"}, "tags": [tag]}
 
 
-def send_feedback(run_id: str | None, scores: dict, comment: str = "", correction: dict | None = None) -> str:
-    """Store feedback locally (for the accuracy page) and in LangSmith on the run it judges."""
-    st.session_state.setdefault("feedback_log", []).append({"run_id": run_id, **scores, "comment": comment,
-                                                            "correction": correction, "time": ist_time()})
+def send_feedback(run_id: str | None, scores: dict, comment: str = "", correction: dict | None = None,
+                  incident: str | None = None) -> str:
+    """Store feedback locally (for the accuracy page) and in LangSmith on the run it judges.
+
+    Feedback is evaluation data only: it is never fed back into the rules, the model or the prompt automatically.
+    """
+    st.session_state.setdefault("feedback_log", []).append({"incident": incident, "run_id": run_id, **scores,
+                                                            "comment": comment, "correction": correction,
+                                                            "time": ist_time()})
     if ls_client is None or not run_id:
         return "saved in this session (LangSmith is not connected)"
     try:
@@ -3438,8 +3444,75 @@ def status_badge(label: str, col: str) -> str:
     return f"<span class='badge c-{col}'>{icon} {label}</span>"
 
 
+# ----------------------- Roles, rights and the incident lifecycle -----------------------
+# Role-based access control for this prototype: it decides what the signed-in user may DO in the Command Center.
+# It is not authentication; a real deployment would put this behind the control room's own identity provider.
+ROLES = ["Communication Officer", "Dispatch Officer", "Department Coordinator", "Shift Supervisor", "Administrator"]
+ROLE_RIGHTS = {
+    "Communication Officer": {"call"},                                  # takes calls, reads the board
+    "Dispatch Officer": {"call", "dispatch"},                           # approves, cancels and assigns units
+    "Department Coordinator": {"dispatch"},                             # works their own agency's units
+    "Shift Supervisor": {"call", "dispatch", "close", "admin"},
+    "Administrator": {"call", "dispatch", "close", "admin"},
+}
+RIGHT_NAMES = {"dispatch": "approve or cancel units", "close": "resolve and close incidents",
+               "admin": "administration and data reset"}
+# New → Information gathering → Confirmed → Dispatch recommended → Dispatched → En route → On scene → Resolved → Closed
+LIFECYCLE = ["Intake", "Verifying location", "Awaiting assignment", "Awaiting approval", "Units en route",
+             "On scene", "Completed", "Resolved", "Closed"]
+EVENT_STATUS.update({"Incident resolved": "Resolved", "Incident closed": "Closed"})
+
+
+def can(right: str, p: dict | None = None) -> bool:
+    """True when the signed-in role is allowed to perform this action."""
+    return right in ROLE_RIGHTS.get((p or cc_prefs()).get("role", ""), set())
+
+
+def role_note(right: str, p: dict | None = None) -> str:
+    p = p or cc_prefs()
+    return (f"Your role ({p.get('role', 'unknown')}) can view this but not {RIGHT_NAMES.get(right, right)}. "
+            "Change the role in ⚙️ Settings to act on it.")
+
+
+def resolve_incident(c_: dict, actor: str, note: str = "") -> bool:
+    """On-scene work is finished: every unit goes back in service and the incident waits for closure."""
+    if c_.get("resolved_at") or c_.get("closed_at"):
+        return False
+    c_["resolved_at"], c_["resolved_by"] = time.time(), actor
+    for a_ in c_.get("assignments", []):
+        if a_.get("unit"):
+            cad_store()["used_units"].discard(a_["unit"])
+            a_["released"] = True
+    add_event(c_, "✅", f"Incident resolved by {actor}" + (f": {note}" if note else "") + "; units back in service",
+              etype="Incident resolved", actor=actor, details=note or None)
+    return True
+
+
+def close_incident(c_: dict, actor: str, note: str = "") -> bool:
+    """Closure after resolution: the record stops changing and stays as history (the ERSS Action Taken Report step)."""
+    if c_.get("closed_at") or not c_.get("resolved_at"):
+        return False
+    c_["closed_at"], c_["closed_by"] = time.time(), actor
+    add_event(c_, "🔚", f"Incident closed by {actor}" + (f": {note}" if note else ""), etype="Incident closed",
+              actor=actor, details=note or None)
+    return True
+
+
+def next_states(c_: dict) -> list[str]:
+    """The only transitions a human may make from here (anything else is driven by the call and the units)."""
+    if c_.get("closed_at"):
+        return []
+    if c_.get("resolved_at"):
+        return ["Closed"]
+    return ["Resolved"]
+
+
 def incident_status(c_: dict) -> tuple[str, str]:
     sl, units = c_["slots"], [a_ for a_ in c_.get("assignments", []) if not a_.get("cancelled")]
+    if c_.get("closed_at"):
+        return "Closed", "done"
+    if c_.get("resolved_at"):
+        return "Resolved", "done"
     if c_.get("certainty") in ("question", "hypothetical") and not c_.get("dispatched"):
         return "Information only", "gray"
     if not sl.get("location") or not sl.get("problems"):
@@ -3471,7 +3544,7 @@ def all_incidents() -> list[dict]:
 
 
 def kpis(incs: list[dict]) -> dict:
-    active = [c_ for c_ in incs if incident_status(c_)[0] not in ("Completed", "Information only")]
+    active = [c_ for c_ in incs if incident_status(c_)[0] not in ("Completed", "Resolved", "Closed", "Information only")]
     units = [a_ for c_ in incs for a_ in c_.get("assignments", []) if a_.get("unit") and not a_.get("cancelled")]
     moving = [a_ for a_ in units if unit_state(a_)[0] in ("Dispatched", "En route", "On scene", "Transporting")]
     resp = [(a_["arrived_at"] - a_["sent_at"]) / a_.get("speed", sim_seconds) for a_ in units if a_.get("arrived_at") and a_.get("sent_at")]
@@ -3482,7 +3555,79 @@ def kpis(incs: list[dict]) -> dict:
             "Units dispatched": len(moving),
             "Awaiting assignment": sum(1 for c_ in active if incident_status(c_)[0] in ("Verifying location", "Awaiting assignment",
                                                                                        "Awaiting approval", "Intake")),
+            "Resolved": sum(1 for c_ in incs if incident_status(c_)[0] in ("Resolved", "Closed")),
             "Average response": (f"{sum(resp) / len(resp):.1f} min" if resp else "—")}
+
+
+# ----------------------- Reporting tables (built only from recorded incident data) -----------------------
+INC_COLS = ["Incident ID", "Received", "Date", "Hour", "Incident", "Category", "Priority", "Severity", "Status",
+            "Location", "Location verified", "People", "Departments", "Units", "Call handling (min)",
+            "Dispatch delay (min)", "Response (sim min)", "Resolution (min)", "Escalated"]
+UNIT_COLS = ["Incident ID", "Department", "Agency", "Unit / ticket", "Role", "Task", "Recommended by", "Approved by",
+             "Status", "Dispatched", "Arrived", "Response (sim min)"]
+
+
+def ops_table(incs: list[dict]) -> pd.DataFrame:
+    """One row per incident. Every field is something the system recorded; blanks stay blank."""
+    rows = []
+    for c_ in incs:
+        sl = c_["slots"]
+        units = [a_ for a_ in c_.get("assignments", []) if not a_.get("cancelled")]
+        created = c_.get("created", c_["started"])
+        sent = [a_["sent_at"] for a_ in units if a_.get("sent_at")]
+        resp = [(a_["arrived_at"] - a_["sent_at"]) / a_.get("speed", sim_seconds)
+                for a_ in units if a_.get("arrived_at") and a_.get("sent_at")]
+        rows.append({
+            "Incident ID": c_["ref"], "Received": ist_stamp(created), "Date": ist_date(created), "Hour": ist(created).hour,
+            "Incident": incident_label(c_),
+            "Category": ", ".join(PROBLEMS[p_]["label"] for p_ in sl.get("problems", [])) or "Unclassified",
+            "Priority": PRIO_STYLE[c_["level"]][0] if c_.get("level") else "—", "Severity": int(c_.get("severity", 0)),
+            "Status": incident_status(c_)[0], "Location": sl.get("location") or "not given",
+            "Location verified": bool(sl.get("location_ok")), "People": sl.get("people"),
+            "Departments": ", ".join(dict.fromkeys(a_["dept"] for a_ in units)) or "—",
+            "Units": ", ".join(a_.get("unit") or a_.get("ticket") or "—" for a_ in units) or "—",
+            "Call handling (min)": round((c_["ended_at"] - c_["started"]) / 60, 2) if c_.get("ended_at") else None,
+            "Dispatch delay (min)": round((min(sent) - created) / 60, 2) if sent else None,
+            "Response (sim min)": round(min(resp), 1) if resp else None,
+            "Resolution (min)": round((c_["resolved_at"] - created) / 60, 2) if c_.get("resolved_at") else None,
+            "Escalated": "; ".join(c_.get("escalated", [])),
+        })
+    return pd.DataFrame(rows, columns=INC_COLS)
+
+
+def unit_table(incs: list[dict]) -> pd.DataFrame:
+    """One row per unit or helpline ticket, showing who recommended it and who approved it."""
+    rows = []
+    for c_ in incs:
+        for a_ in c_.get("assignments", []):
+            rows.append({
+                "Incident ID": c_["ref"], "Department": a_["dept"], "Agency": AGENCY.get(a_["dept"], a_["dept"]),
+                "Unit / ticket": a_.get("unit") or a_.get("ticket") or "—", "Role": a_.get("role", ""),
+                "Task": a_.get("why", ""), "Recommended by": "CAD run card (AI-assisted)",
+                "Approved by": a_.get("approved_by") or ("awaiting approval" if a_.get("approval") == "awaiting" else "—"),
+                "Status": unit_state(a_)[0],
+                "Dispatched": ist_time(a_["sent_at"]) if a_.get("sent_at") else "—",
+                "Arrived": ist_time(a_["arrived_at"]) if a_.get("arrived_at") else "—",
+                "Response (sim min)": round((a_["arrived_at"] - a_["sent_at"]) / a_.get("speed", sim_seconds), 1)
+                if a_.get("arrived_at") and a_.get("sent_at") else None})
+    return pd.DataFrame(rows, columns=UNIT_COLS)
+
+
+def fleet_table(incs: list[dict]) -> pd.DataFrame:
+    """Every response resource in the simulated fleet and what it is committed to."""
+    busy = {}
+    for c_ in incs:
+        for a_ in c_.get("assignments", []):
+            if a_.get("unit") and not a_.get("cancelled"):
+                busy[a_["unit"]] = (c_["ref"], unit_state(a_)[0])
+    rows = []
+    for v in VEHICLES:
+        ref, stt = busy.get(v["Vehicle ID"], (None, None))
+        committed = v["Vehicle ID"] in cad_store()["used_units"]
+        rows.append({"Unit": v["Vehicle ID"], "Type": v["Type"], "Home station (demo grid)": str(v["Station"]),
+                     "Status": stt if (stt and committed) else ("Committed" if committed else "Available"),
+                     "Assigned to": ref if committed else "—"})
+    return pd.DataFrame(rows, columns=["Unit", "Type", "Home station (demo grid)", "Status", "Assigned to"])
 
 
 def describe(c_: dict) -> str:
@@ -3638,8 +3783,10 @@ def settings_panel(p: dict) -> None:
     p["high_contrast"] = c7.toggle("High contrast", value=p["high_contrast"], key="cc_hc")
     p["reduce_motion"] = c5.toggle("Reduce motion", value=p["reduce_motion"], key="cc_rm")
     p["profile"] = st.text_input("Dispatcher name", value=p["profile"], key="cc_profile")
-    p["role"] = st.selectbox("Role", ["Dispatch Officer", "Communication Officer", "Shift Supervisor"],
-                             index=["Dispatch Officer", "Communication Officer", "Shift Supervisor"].index(p["role"]), key="cc_role")
+    p["role"] = st.selectbox("Role", ROLES, index=ROLES.index(p["role"]) if p["role"] in ROLES else 1, key="cc_role",
+                             help="Role-based access control: it decides who may approve units, resolve incidents and "
+                                  "reset data. This prototype does not authenticate the person behind the role.")
+    st.caption("This role may: " + ", ".join(sorted(ROLE_RIGHTS.get(p["role"], {"view only"}))) + ".")
     if st.button("Save as my defaults", key="cc_save"):
         cad_store()["prefs"][p["profile"]] = dict(p)
         st.success("Saved on this server for this dispatcher name (until the app restarts).")
@@ -3648,8 +3795,8 @@ def settings_panel(p: dict) -> None:
 
 st.session_state.used_vehicle_ids = cad_store()["used_units"]     # one fleet for every session
 
-tab_cc, tab_call, tab_dept, tab_acc, tab2 = st.tabs(["🖥️ Command Center", "📞 Emergency call", "🏢 Departments & agents",
-                                                    "📊 Accuracy & observability", "🚑 Dispatch board"])
+tab_cc, tab_call, tab_dept, tab_ops, tab_acc = st.tabs(["Command Center", "Emergency call", "Departments & agencies",
+                                                        "Operations & reports", "Accuracy & observability"])
 
 
 with tab_cc:
@@ -3767,22 +3914,49 @@ with tab_cc:
                     st.markdown(cad_card_html(sel), unsafe_allow_html=True)
                     pend = [a_ for a_ in sel.get("assignments", []) if a_.get("approval") == "awaiting"]
                     act = [a_ for a_ in sel.get("assignments", []) if not a_.get("cancelled") and unit_state(a_)[0] not in ("Completed",)]
-                    b1, b2, b3 = st.columns([1.2, 1.6, 1.2])
                     who = f"{p['profile']} ({p['role']})"
-                    if pend and b1.button(f"✅ Approve all ({len(pend)})", type="primary", key=f"appr_{sel['ref']}", width="stretch"):
-                        for a_ in pend:
-                            approve_unit(sel, a_, who)
-                        st.rerun(scope="app")
-                    if act:
-                        pick = b2.selectbox("Unit", [a_.get("unit") or a_.get("ticket") or a_["dept"] for a_ in act],
-                                            key=f"pick_{sel['ref']}", label_visibility="collapsed")
-                        tgt = next(a_ for a_ in act if (a_.get("unit") or a_.get("ticket") or a_["dept"]) == pick)
-                        if tgt.get("approval") == "awaiting" and b3.button("Approve unit", key=f"ap1_{sel['ref']}", width="stretch"):
-                            approve_unit(sel, tgt, who)
+                    if not can("dispatch", p):
+                        st.caption("🔒 " + role_note("dispatch", p))
+                    elif sel.get("closed_at"):
+                        st.caption("This incident is closed. Its record and timeline stay as history.")
+                    else:
+                        b1, b2, b3 = st.columns([1.2, 1.6, 1.2])
+                        if pend and b1.button(f"Approve all ({len(pend)})", type="primary", key=f"appr_{sel['ref']}", width="stretch"):
+                            for a_ in pend:
+                                approve_unit(sel, a_, who)
                             st.rerun(scope="app")
-                        elif tgt.get("approval") != "awaiting" and b3.button("Cancel unit", key=f"can_{sel['ref']}", width="stretch"):
-                            cancel_unit(sel, tgt, who, "cancelled by the dispatcher")
-                            st.rerun(scope="app")
+                        if act:
+                            pick = b2.selectbox("Unit", [a_.get("unit") or a_.get("ticket") or a_["dept"] for a_ in act],
+                                                key=f"pick_{sel['ref']}", label_visibility="collapsed")
+                            tgt = next(a_ for a_ in act if (a_.get("unit") or a_.get("ticket") or a_["dept"]) == pick)
+                            if tgt.get("approval") == "awaiting" and b3.button("Approve unit", key=f"ap1_{sel['ref']}", width="stretch"):
+                                approve_unit(sel, tgt, who)
+                                st.rerun(scope="app")
+                            elif tgt.get("approval") != "awaiting" and b3.button("Cancel unit", key=f"can_{sel['ref']}", width="stretch"):
+                                cancel_unit(sel, tgt, who, "cancelled by the dispatcher")
+                                st.rerun(scope="app")
+                        # ---- incident lifecycle: only the transitions that are valid from here are offered
+                        moves = next_states(sel)
+                        if moves and can("close", p):
+                            st.markdown("<div class='cc'><div class='sec'>Incident lifecycle</div></div>", unsafe_allow_html=True)
+                            l1, l2 = st.columns([2.4, 1.2])
+                            note_ = l1.text_input("Closing note (what was done; it goes in the audit trail)",
+                                                  key=f"lc_note_{sel['ref']}", label_visibility="collapsed",
+                                                  placeholder="Note for the audit trail (optional)")
+                            busy = [a_ for a_ in sel.get("assignments", []) if a_.get("unit") and not a_.get("cancelled")
+                                    and not (a_.get("arrived") or a_.get("released") or a_.get("atr"))]
+                            if "Resolved" in moves:
+                                if busy:
+                                    l2.button("Mark resolved", key=f"res_{sel['ref']}", width="stretch", disabled=True,
+                                              help="Units are still responding: " + ", ".join(a_["unit"] for a_ in busy))
+                                elif l2.button("Mark resolved", key=f"res_{sel['ref']}", width="stretch"):
+                                    resolve_incident(sel, who, note_.strip())
+                                    st.rerun(scope="app")
+                            elif "Closed" in moves and l2.button("Close incident", type="primary", key=f"cls_{sel['ref']}", width="stretch"):
+                                close_incident(sel, who, note_.strip())
+                                st.rerun(scope="app")
+                        elif moves:
+                            st.caption("🔒 " + role_note("close", p))
             if "Agencies" in p["sections"]:
                 st.markdown("##### Agency coordination")
                 st.markdown(agencies_html(sel, p), unsafe_allow_html=True)
@@ -3992,26 +4166,48 @@ with tab_call:
                 d1.download_button("Download transcript", call_transcript(call).encode("utf-8"), f"{call['ref']}.txt",
                                    "text/plain", width="stretch")
                 with st.container(border=True):
-                    st.markdown("**Was this call handled correctly?** Your answer measures accuracy"
-                                + (" and is sent to LangSmith." if ls_client else "."))
+                    st.markdown(f"**Was call {call['ref']} handled correctly?** One short form; it is kept as evaluation "
+                                "data against this incident"
+                                + (" and sent to LangSmith." if ls_client else " in this session."))
                     if call.get("feedback_done"):
-                        st.success("Thanks: " + call["feedback_done"])
+                        st.success(f"Feedback recorded against {call['ref']}: " + call["feedback_done"])
                     else:
-                        ok = st.feedback("thumbs", key=f"fb_ok_{call['ref']}")
                         sent = [a_["dept"] for a_ in call["assignments"]]
-                        should = st.multiselect("Departments that should have been sent", list(DEPARTMENTS), default=list(dict.fromkeys(sent)),
+                        sl_fb = call["slots"]
+                        ok = st.feedback("thumbs", key=f"fb_ok_{call['ref']}")
+                        g1, g2 = st.columns(2)
+                        cat_now = ", ".join(PROBLEMS[x]["label"] for x in sl_fb.get("problems", [])) or "none"
+                        cat_ok = g1.multiselect(f"Correct incident type (system said: {cat_now})",
+                                                [PROBLEMS[x]["label"] for x in PROBLEMS],
+                                                default=[PROBLEMS[x]["label"] for x in sl_fb.get("problems", [])],
+                                                key=f"fb_cat_{call['ref']}")
+                        should = g2.multiselect("Correct departments", list(DEPARTMENTS), default=list(dict.fromkeys(sent)),
                                                 key=f"fb_dep_{call['ref']}")
                         sev_ok = st.select_slider("Correct severity", options=[1, 2, 3, 4, 5], value=call["severity"],
                                                   key=f"fb_sev_{call['ref']}")
-                        note = st.text_input("Comment (optional)", key=f"fb_note_{call['ref']}")
-                        if st.button("Send feedback", key=f"fb_send_{call['ref']}"):
+                        g3, g4 = st.columns(2)
+                        loc_ok = g3.radio("Was the location right?", ["Yes", "No", "Not established"], horizontal=True,
+                                          key=f"fb_loc_{call['ref']}")
+                        loc_fix = g4.text_input("Correct location (only if it was wrong)", key=f"fb_locfix_{call['ref']}",
+                                                placeholder=sl_fb.get("location") or "not given")
+                        issues = st.multiselect("What went wrong, if anything?",
+                                                ["Speech recognition misheard the caller", "Wrong incident type",
+                                                 "Wrong severity", "Wrong departments", "Wrong or missing location",
+                                                 "Questions asked in the wrong order", "Information was missed",
+                                                 "AI stated something the caller never said"], key=f"fb_iss_{call['ref']}")
+                        note = st.text_area("Comment (optional)", key=f"fb_note_{call['ref']}", height=70)
+                        if st.button("Send feedback", type="primary", key=f"fb_send_{call['ref']}"):
                             p_, e_ = set(sent), set(should)
                             f1 = (2 * len(p_ & e_) / (len(p_) + len(e_))) if (p_ or e_) else 1.0
                             scores = {"routing_correct": float(ok == 1) if ok is not None else float(p_ == e_),
                                       "department_f1": round(f1, 3),
-                                      "severity_error": float(abs(call["severity"] - sev_ok))}
-                            call["feedback_done"] = send_feedback(call.get("dispatch_run") or (call.get("run_ids") or [None])[-1],
-                                                                  scores, note, {"departments": should, "severity": sev_ok})
+                                      "severity_error": float(abs(call["severity"] - sev_ok)),
+                                      "location_correct": {"Yes": 1.0, "No": 0.0, "Not established": 0.0}[loc_ok]}
+                            call["feedback_done"] = send_feedback(
+                                call.get("dispatch_run") or (call.get("run_ids") or [None])[-1], scores, note,
+                                {"incident_type": cat_ok, "departments": should, "severity": sev_ok,
+                                 "location": loc_fix.strip() or sl_fb.get("location"), "issues": issues},
+                                incident=call["ref"])
                             st.rerun()
                 if d2.button("📞 New call", type="primary", width="stretch"):
                     st.session_state.call_closed_seen = True
@@ -4262,79 +4458,157 @@ with tab_acc:
         st.caption("Method: " + ("Groq AI with constrained outputs" if use_groq else "keyword rules")
                    + ". ❌ rows are the cases to fix next, exactly like an error analysis.")
 
-with tab2:
-    st.subheader("Prioritized incident and dispatch board")
-    emergency_calls = [c for c in st.session_state.calls if c.get("is_emergency") and not c.get("duplicate_of")]
-    # A simple duplicate grouping by exact normalized location + incident type.
-    grouped = {}
-    for call in emergency_calls:
-        key = (call.get("location"), call.get("incident_type"))
-        if key not in grouped:
-            grouped[key] = {
-                "Incident ID": f"INC-{len(grouped) + 1:03d}",
-                "Location": call.get("location"),
-                "Incident type": call.get("incident_type"),
-                "Severity": int(call.get("severity", 3)),
-                "Calls": call.get("callers", 1),
-                "Summary": call.get("summary", ""),
-                "Call IDs": [call.get("Call ID")],
-                "Help vehicle": call.get("Help vehicle"),
-            }
-        else:
-            grouped[key]["Calls"] += call.get("callers", 1)
-            grouped[key]["Severity"] = max(grouped[key]["Severity"], int(call.get("severity", 3)))
-            grouped[key]["Call IDs"].append(call.get("Call ID"))
-            grouped[key]["Help vehicle"] = grouped[key].get("Help vehicle") or call.get("Help vehicle")
-    incidents = sorted(grouped.values(), key=lambda i: (-i["Severity"], i["Incident ID"]))
-    if not incidents:
-        st.info("Triage an emergency call first to populate the dispatch board.")
+with tab_ops:
+    P_OPS = cc_prefs()
+    st.markdown(cc_css(P_OPS), unsafe_allow_html=True)
+    st.subheader("Operations & reports")
+    st.caption("Management view of everything this control room has handled. Every number is computed from incidents "
+               "actually created in this app — nothing here is sample data. Travel and response times come from the "
+               "simulated road grid, not live traffic, so they measure the workflow, not real-world performance.")
+    incs_ops = all_incidents()
+    if not incs_ops:
+        st.info("No incidents yet. Take an **Emergency call** and the register, KPIs and charts here fill up from it.")
     else:
-        board = pd.DataFrame(incidents)
-        board["Location"] = board["Location"].fillna("Unknown: call back")
-        st.dataframe(board[["Incident ID", "Location", "Incident type", "Severity", "Calls", "Summary"]], width="stretch")
-        if st.button("Dispatch available vehicles", type="primary"):
-            graph = add_closures(make_city_graph(), closure_rows, closure_cols)
-            available = [v.copy() for v in VEHICLES if v["Vehicle ID"] not in st.session_state.used_vehicle_ids]
-            results = []
-            for inc in incidents:
-                if inc.get("Help vehicle"):
-                    results.append({"Incident ID": inc["Incident ID"], "Location": inc["Location"], "Severity": inc["Severity"],
-                                    "Vehicle": inc["Help vehicle"], "Estimated travel (simulated min)": None,
-                                    "Status": "Handled from Emergency Help (vehicle already sent)"})
-                    continue
-                assigned, minutes = choose_vehicle(inc["Incident type"], inc["Location"], graph, available)
-                if assigned is None:
-                    results.append({
-                        "Incident ID": inc["Incident ID"], "Location": inc["Location"] or "Unknown",
-                        "Severity": inc["Severity"], "Vehicle": "UNASSIGNED",
-                        "Estimated travel (simulated min)": None,
-                        "Status": "Needs location: call the reporter back" if not inc["Location"] else "No available reachable vehicle",
-                    })
-                    continue
-                # Claim the vehicle exactly once for this dispatch batch.
-                st.session_state.used_vehicle_ids.add(assigned["Vehicle ID"])
-                available = [v for v in available if v["Vehicle ID"] != assigned["Vehicle ID"]]
-                results.append({
-                    "Incident ID": inc["Incident ID"], "Location": inc["Location"],
-                    "Severity": inc["Severity"], "Vehicle": assigned["Vehicle ID"],
-                    "Estimated travel (simulated min)": round(minutes, 1), "Status": "Assigned"
-                })
-            st.session_state.dispatches = results
-            st.success("Dispatch batch completed. Assigned vehicles cannot be reused in this session.")
-        if st.session_state.dispatches:
-            st.markdown("#### Latest dispatch result")
-            st.dataframe(pd.DataFrame(st.session_state.dispatches), width="stretch")
-            st.download_button(
-                "Download dispatch results (CSV)",
-                pd.DataFrame(st.session_state.dispatches).to_csv(index=False).encode("utf-8"),
-                file_name="dispatch_results.csv",
-                mime="text/csv",
-            )
-    if st.button("Reset demo state"):
-        st.session_state.calls = []
-        st.session_state.dispatches = []
-        st.session_state.used_vehicle_ids.clear()
-        st.rerun()
+        df_all = ops_table(incs_ops)
+        units_all = unit_table(incs_ops)
+
+        # ---- filters
+        f1_, f2_, f3_, f4_ = st.columns([1.2, 1.2, 1.5, 1.6])
+        d_sel = f1_.multiselect("Date", sorted(df_all["Date"].unique(), reverse=True), key="ops_date", placeholder="Any date")
+        p_sel = f2_.multiselect("Priority", ["P1", "P2", "P3", "P4"], key="ops_prio", placeholder="Any priority")
+        s_sel = f3_.multiselect("Status", [s for s in LIFECYCLE + ["Active", "Information only"] if s in set(df_all["Status"])],
+                                key="ops_status", placeholder="Any status")
+        dep_sel = f4_.multiselect("Department", list(DEPARTMENTS), key="ops_dept", placeholder="Any department")
+        q_ops = st.text_input("Search", key="ops_q", label_visibility="collapsed",
+                              placeholder="Search incident ID, category, location or unit…")
+        d = df_all
+        if d_sel:
+            d = d[d["Date"].isin(d_sel)]
+        if p_sel:
+            d = d[d["Priority"].isin(p_sel)]
+        if s_sel:
+            d = d[d["Status"].isin(s_sel)]
+        if dep_sel:
+            keep = {r["Incident ID"] for _, r in units_all.iterrows() if r["Department"] in dep_sel}
+            d = d[d["Incident ID"].isin(keep)]
+        if q_ops:
+            ql = q_ops.lower()
+            d = d[d.apply(lambda r: ql in " ".join(str(v) for v in r.values).lower(), axis=1)]
+        du = units_all[units_all["Incident ID"].isin(set(d["Incident ID"]))]
+        st.caption(f"Showing {len(d)} of {len(df_all)} incidents.")
+
+        def avg_(col: str, unit: str = "min") -> str:
+            v = d[col].dropna()
+            return f"{v.mean():.1f} {unit}" if len(v) else "—"
+
+        closed_set = {"Resolved", "Closed", "Completed"}
+        k1 = st.columns(5)
+        k1[0].metric("Total incidents", len(d))
+        k1[1].metric("Active", int((~d["Status"].isin(closed_set | {"Information only"})).sum()))
+        k1[2].metric("Resolved / closed", int(d["Status"].isin(closed_set).sum()))
+        k1[3].metric("P1 critical", int((d["Priority"] == "P1").sum()))
+        k1[4].metric("Awaiting assignment",
+                     int(d["Status"].isin({"Intake", "Verifying location", "Awaiting assignment", "Awaiting approval"}).sum()),
+                     help="Incidents with no approved unit yet, including those still waiting for a confirmed location.")
+        k2 = st.columns(5)
+        k2[0].metric("Average call handling", avg_("Call handling (min)"), help="From the call connecting to the call ending.")
+        k2[1].metric("Average dispatch delay", avg_("Dispatch delay (min)"),
+                     help="From the incident being created to the first unit being dispatched (wall-clock).")
+        k2[2].metric("Average response", avg_("Response (sim min)"),
+                     help="First unit's travel time on the simulated road grid. Simulated, not real.")
+        k2[3].metric("Average time to resolve", avg_("Resolution (min)"), help="Creation to the dispatcher marking it resolved.")
+        k2[4].metric("Location verified", f"{100 * d['Location verified'].mean():.0f}%" if len(d) else "—",
+                     help="Share of incidents where the caller confirmed a location that the CAD could place.")
+
+        # ---- how much of the AI's work humans accepted, measured from the audit trail only
+        approved = int((du["Approved by"].notna() & ~du["Approved by"].isin(["—", "awaiting approval"])).sum())
+        cancelled = int((du["Status"] == "Cancelled").sum())
+        auto = int(du["Approved by"].astype(str).str.contains("Auto-approval").sum())
+        k3 = st.columns(5)
+        k3[0].metric("Units recommended", len(du), help="Every unit and helpline ticket the CAD run card proposed.")
+        k3[1].metric("Approved", approved)
+        k3[2].metric("Cancelled by a human", cancelled)
+        k3[3].metric("Recommendation acceptance",
+                     f"{100 * (approved - cancelled) / len(du):.0f}%" if len(du) else "—",
+                     help="Approved minus human-cancelled, over all recommendations. Auto-approval is a DEMO setting, "
+                          "so it is not evidence that a human agreed.")
+        k3[4].metric("Auto-approved (demo)", auto, help="Approved by the demo's auto-approval policy, not by a person.")
+        if auto:
+            st.caption("⚠️ Auto-approval is on, so most approvals above were made by the system. Switch Command Center → "
+                       "Settings → Dispatch approval to **Dispatcher must approve** for a realistic acceptance rate.")
+
+        # ---- charts
+        if len(d):
+            c1_, c2_ = st.columns(2)
+            with c1_:
+                st.markdown("**Incidents by priority**")
+                st.bar_chart(d["Priority"].value_counts().sort_index(), height=220)
+            with c2_:
+                st.markdown("**Incidents by category**")
+                st.bar_chart(d["Category"].value_counts().head(10), height=220)
+            c3_, c4_ = st.columns(2)
+            with c3_:
+                st.markdown("**Department workload** (units and tickets assigned)")
+                if len(du):
+                    st.bar_chart(du["Department"].value_counts(), height=220)
+                else:
+                    st.caption("No units assigned in this selection yet.")
+            with c4_:
+                st.markdown("**Calls received by hour of day (IST)**")
+                st.bar_chart(d["Hour"].value_counts().sort_index(), height=220)
+
+        # ---- response resources (the fleet view that used to live on the dispatch board)
+        st.markdown("##### Response resources")
+        fl = fleet_table(incs_ops)
+        busy_n = int((fl["Status"] != "Available").sum())
+        r1, r2, r3 = st.columns([1, 1, 2])
+        r1.metric("Fleet size", len(fl))
+        r2.metric("Committed", busy_n)
+        r3.metric("Utilisation", f"{100 * busy_n / len(fl):.0f}%",
+                  help="Share of the simulated fleet currently committed to an incident.")
+        st.dataframe(fl, hide_index=True, width="stretch", height=min(36 * (len(fl) + 1), 260))
+
+        # ---- registers and exports
+        st.markdown("##### Incident register")
+        st.dataframe(d.drop(columns=["Hour"]), hide_index=True, width="stretch",
+                     column_config={"Incident": st.column_config.TextColumn("Incident", width="medium")})
+        e1_, e2_, e3_ = st.columns(3)
+        e1_.download_button("Incident register (CSV)", d.to_csv(index=False).encode("utf-8"),
+                            "incident_register.csv", "text/csv", width="stretch")
+        e2_.download_button("Unit assignments (CSV)", du.to_csv(index=False).encode("utf-8"),
+                            "unit_assignments.csv", "text/csv", width="stretch")
+        audit_rows = [{**e, "Incident ID": c_["ref"], "Time": ist_stamp(e["ts"])}
+                      for c_ in incs_ops if c_["ref"] in set(d["Incident ID"]) for e in c_.get("audit", [])]
+        e3_.download_button("Audit trail (CSV)",
+                            pd.DataFrame(audit_rows).drop(columns=["ts", "icon"], errors="ignore").to_csv(index=False).encode("utf-8")
+                            if audit_rows else b"no events",
+                            "audit_trail.csv", "text/csv", width="stretch", disabled=not audit_rows)
+        with st.expander("Unit assignments: who recommended, who approved"):
+            st.dataframe(du, hide_index=True, width="stretch")
+            st.caption("Every unit here is a **simulated** dispatch on the demo road grid. No real agency was contacted.")
+
+    st.markdown("---")
+    if can("admin", P_OPS):
+        with st.expander("Administration"):
+            st.caption("Clears every incident, call, unit assignment and agent trace held on this server. "
+                       "Synthetic data only, but it affects every session using this app.")
+            if st.checkbox("I understand this clears all demo data", key="ops_reset_ok") and \
+                    st.button("Reset all demo data", key="ops_reset"):
+                store_ = cad_store()
+                store_["incidents"].clear()
+                store_["used_units"].clear()
+                store_["seq"] = 0
+                for k_ in ("calls", "dispatches", "agent_runs", "dept_jobs", "feedback_log", "acc_rows"):
+                    st.session_state[k_] = []
+                st.session_state.call = None
+                st.session_state.cc_sel = None
+                st.rerun()
+    else:
+        st.caption("Administration (resetting demo data) is open to the Shift Supervisor and Administrator roles. "
+                   f"You are signed in as **{P_OPS['role']}**; change it in Command Center → ⚙️ Settings.")
 
 st.divider()
-st.caption("Audit note: this demo displays triage method, confidence, call history, incident grouping, and simulated dispatch estimates. Verify all logic and safety requirements before any real-world use.")
+st.caption("Audit note: every incident keeps an append-only trail of who decided what — AI classification, CAD "
+           "recommendation, human approval, unit status and closure — exportable from Operations & reports. "
+           "AI output is a recommendation, never a confirmed fact, and dispatch is simulated. Verify all logic and "
+           "safety requirements before any real-world use.")
