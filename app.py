@@ -3344,6 +3344,25 @@ use_model = triage_model is not None         # used automatically when triage_mo
 closure_rows, closure_cols = [], []          # no simulated road closures
 sim_seconds = 4.0                            # demo speed: 4 real seconds per simulated minute (a 7-minute trip = 28 s)
 
+# ----------------------- Base map tiles (CARTO needs a free API key) -----------------------
+# CARTO's basemaps now refuse keyless requests and draw an "API KEY REQUIRED" watermark over every tile.
+# Get a free key at https://carto.com/basemaps/apikey/ and put it in Secrets as CARTO_API_KEY.
+# Without a key the app falls back to plain OpenStreetMap, which needs no key.
+CARTO_KEY = _secret("CARTO_API_KEY")
+CARTO_STYLES = {"Dark": "dark_all", "Light": "light_all", "Street": "voyager"}
+CARTO_ATTR = ('&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors '
+              '&copy; <a href="https://carto.com/attributions">CARTO</a>')
+OSM_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OSM_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+
+
+def basemap_layers() -> dict[str, tuple[str, str]]:
+    """Base map name -> (tile URL template, attribution). CARTO styles when a key is set, otherwise OpenStreetMap."""
+    if not CARTO_KEY:
+        return {"Street": (OSM_URL, OSM_ATTR)}
+    return {name: (f"https://{{s}}.basemaps.cartocdn.com/rastertiles/{style}/{{z}}/{{x}}/{{y}}.png?key={CARTO_KEY}",
+                   CARTO_ATTR) for name, style in CARTO_STYLES.items()}
+
 if "calls" not in st.session_state:
     st.session_state.calls = []
 if "dispatches" not in st.session_state:
@@ -3554,14 +3573,16 @@ def agencies_html(c_: dict, p: dict) -> str:
 
 def india_map(incs: list[dict], selected: str | None, p: dict, center=None):
     """Interactive India map: verified incident locations only (unit GPS is not available in this demo)."""
-    tiles = {"Dark": "CartoDB dark_matter", "Light": "CartoDB positron", "Street": "OpenStreetMap"}
+    tiles = basemap_layers()
     sel = next((c_ for c_ in incs if c_["ref"] == selected), None)
     if center is None and sel and sel["slots"].get("geo") and sel["slots"].get("location_ok"):
         center = (sel["slots"]["geo"]["lat"], sel["slots"]["geo"]["lon"])
     m = folium.Map(location=center or (22.6, 79.0), zoom_start=13 if center else p["zoom"], tiles=None, control_scale=True,
                    max_bounds=True, min_lat=5, max_lat=38, min_lon=66, max_lon=99)
-    for name, t in tiles.items():
-        folium.TileLayer(t, name=f"Base map: {name}", show=(name == p["tiles"])).add_to(m)
+    shown = p["tiles"] if p["tiles"] in tiles else next(iter(tiles))     # chosen style, or the only one available
+    for name, (url, attr) in tiles.items():
+        folium.TileLayer(tiles=url, attr=attr, name=f"Base map: {name}", subdomains="abcd", max_zoom=20,
+                         show=(name == shown)).add_to(m)
     fg = folium.FeatureGroup(name="Incidents", show="Incidents" in p["layers"])
     colours = {"red": "#e5484d", "orange": "#f0883e", "amber": "#e2b33c", "green": "#3fb87f", "blue": "#4c8ff0"}
     for c_ in incs:
