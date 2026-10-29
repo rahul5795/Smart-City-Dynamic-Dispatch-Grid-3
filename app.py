@@ -3425,10 +3425,28 @@ table.ut td{{border-bottom:1px solid var(--cc-border);padding:6px;vertical-align
 .ag{{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}}
 .ag .panel{{margin:0}}.ag .lead{{border-color:var(--blue)}}
 {'.cc *{animation:none !important;transition:none !important}' if p['reduce_motion'] else ''}
-[class*="st-key-kpi_"] button{{min-height:84px;height:84px;border-radius:12px;text-align:left;justify-content:flex-start;background:var(--cc-panel);
-  border:1px solid var(--cc-border)}}
-[class*="st-key-kpi_"] button p{{font-size:.82rem;line-height:1.25;white-space:pre-line;text-align:left}}
-[class*="st-key-kpi_"] button strong{{font-size:1.6rem;display:block}}
+[class*="st-key-kpi_"] button{{min-height:96px;height:100%;width:100%;border-radius:12px;padding:12px 14px;
+  background:var(--cc-panel);border:1px solid var(--cc-border);display:flex;flex-direction:column;align-items:flex-start;
+  justify-content:center;gap:2px;text-align:left}}
+[class*="st-key-kpi_"] button:hover{{border-color:var(--blue)}}
+[class*="st-key-kpi_"] button p{{font-size:.78rem;line-height:1.3;white-space:pre-line;text-align:left;margin:0;
+  color:var(--cc-muted);overflow-wrap:anywhere}}
+[class*="st-key-kpi_"] button strong{{font-size:1.75rem;line-height:1.15;display:block;color:var(--cc-text);
+  font-variant-numeric:tabular-nums;white-space:nowrap}}
+@media (max-width:640px){{[class*="st-key-kpi_"] button{{min-height:78px}}
+  [class*="st-key-kpi_"] button strong{{font-size:1.4rem}}}}
+.cc .prov{{display:inline-block;font-size:.66rem;font-weight:700;letter-spacing:.03em;text-transform:uppercase;
+  border-radius:5px;padding:1px 6px;margin-left:6px;border:1px solid currentColor;vertical-align:middle}}
+.cc .p-ai{{color:var(--blue)}}.cc .p-caller{{color:var(--green)}}.cc .p-sys{{color:var(--gray)}}.cc .p-disp{{color:var(--orange)}}
+.cc .p-none{{color:var(--muted)}}
+.cc .grid2{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px}}
+.cc .res{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}}
+.cc .rescard .hd{{display:flex;align-items:center;gap:8px;margin-bottom:6px}}
+.cc .rescard .hd b{{font-size:.98rem}}.cc .rescard .hd .ic{{font-size:1.2rem}}
+.cc .nums{{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:6px 0}}
+.cc .nums div{{background:rgba(128,128,128,.12);border-radius:8px;padding:6px 8px}}
+.cc .nums b{{display:block;font-size:1.15rem;line-height:1.2;font-variant-numeric:tabular-nums}}
+.cc .nums span{{font-size:.68rem;color:var(--cc-muted);text-transform:uppercase;letter-spacing:.03em}}
 </style>"""
 
 
@@ -3449,14 +3467,14 @@ def status_badge(label: str, col: str) -> str:
 # It is not authentication; a real deployment would put this behind the control room's own identity provider.
 ROLES = ["Communication Officer", "Dispatch Officer", "Department Coordinator", "Shift Supervisor", "Administrator"]
 ROLE_RIGHTS = {
-    "Communication Officer": {"call"},                                  # takes calls, reads the board
-    "Dispatch Officer": {"call", "dispatch"},                           # approves, cancels and assigns units
-    "Department Coordinator": {"dispatch"},                             # works their own agency's units
-    "Shift Supervisor": {"call", "dispatch", "close", "admin"},
-    "Administrator": {"call", "dispatch", "close", "admin"},
+    "Communication Officer": {"call", "pii"},                           # takes calls, needs the caller's number
+    "Dispatch Officer": {"call", "dispatch", "pii"},                    # approves, cancels and assigns units
+    "Department Coordinator": {"dispatch"},                             # works their own agency's units, no caller data
+    "Shift Supervisor": {"call", "dispatch", "close", "admin", "pii"},
+    "Administrator": {"call", "dispatch", "close", "admin", "pii"},
 }
 RIGHT_NAMES = {"dispatch": "approve or cancel units", "close": "resolve and close incidents",
-               "admin": "administration and data reset"}
+               "admin": "administration and data reset", "pii": "see unmasked caller details"}
 # New → Information gathering → Confirmed → Dispatch recommended → Dispatched → En route → On scene → Resolved → Closed
 LIFECYCLE = ["Intake", "Verifying location", "Awaiting assignment", "Awaiting approval", "Units en route",
              "On scene", "Completed", "Resolved", "Closed"]
@@ -3685,14 +3703,196 @@ def cad_card_html(c_: dict) -> str:
             "AI classification is not proof that an allegation is true.</div></div></div>")
 
 
-def timeline_html(c_: dict, p: dict) -> str:
-    ev = sorted(c_.get("audit", []), key=lambda e: (e["ts"], e["id"]))
+KPI_HELP = {   # business definition behind every card, shown as its tooltip
+    "Active incidents": "Incidents not yet resolved, closed or marked information-only.",
+    "P1 critical": "Active incidents at priority P1: life at immediate risk.",
+    "P2 urgent": "Active incidents at priority P2: serious, help needed fast.",
+    "Units available": "Simulated fleet units not committed to any incident right now.",
+    "Units dispatched": "Units currently dispatched, en route, on scene or transporting.",
+    "Awaiting assignment": "Active incidents with no approved unit yet, including those still waiting for a confirmed location.",
+    "Resolved": "Incidents a dispatcher has marked resolved or closed.",
+    "Average response": "Mean travel time of the first unit to reach the scene, on the simulated road grid.",
+}
+QUEUE_STATUSES = ["Intake", "Verifying location", "Awaiting assignment", "Awaiting approval", "Units en route",
+                  "On scene", "Completed", "Resolved", "Closed", "Information only", "Active"]
+CRITICAL_EVENTS = {"Escalated to dispatcher", "Priority changed", "Incident resolved", "Incident closed", "Unit cancelled"}
+PROV = {"ai": ("AI", "p-ai"), "caller": ("Caller", "p-caller"), "system": ("System", "p-sys"),
+        "dispatcher": ("Dispatcher", "p-disp"), "none": ("Not known", "p-none")}
+
+
+def prov(kind: str) -> str:
+    """A small tag saying where a value came from, so an AI guess is never read as a confirmed fact."""
+    label, cls = PROV.get(kind, PROV["none"])
+    return f"<span class='prov {cls}'>{label}</span>"
+
+
+def mask_phone(num: str | None, show: bool = False) -> str:
+    """Caller numbers are masked unless the signed-in role may see personal data."""
+    if not num or num == "not given":
+        return "not given"
+    return f"{num[:5]} {num[5:]}" if show else "•••••• " + num[-4:]
+
+
+def queue_rows(incs: list[dict]) -> list[dict]:
+    """One row per incident for the operator queue (same data everywhere it is shown)."""
+    rows = []
+    for c_ in incs:
+        units_ = [a_ for a_ in c_.get("assignments", []) if not a_.get("cancelled")]
+        rows.append({"ID": c_["ref"], "Incident": incident_label(c_),
+                     "Priority": PRIO_STYLE[c_["level"]][0] if c_.get("level") else "—",
+                     "Location": (c_["slots"].get("location") or "—") + ("" if c_["slots"].get("location_ok") else " (unverified)"),
+                     "Received": ist_time(c_.get("created", c_["started"])), "Status": incident_status(c_)[0],
+                     "Assigned": ", ".join(a_.get("unit") or a_.get("ticket") or a_["dept"] for a_ in units_) or "—",
+                     "_lvl": "EDCBAO".index(c_["level"]) if c_.get("level") else 9, "_t": c_.get("created", 0)})
+    return rows
+
+
+def filter_queue(rows: list[dict], q: str = "", prio: list | None = None, status: list | None = None,
+                 card: str | None = None, sort: str = "Newest") -> list[dict]:
+    """Search, filters, the KPI-card filter and sorting, applied the same way in every module."""
+    out = []
+    for r in rows:
+        if q and q.lower() not in " ".join(str(v) for v in r.values()).lower():
+            continue
+        if prio and r["Priority"] not in prio:
+            continue
+        if status and r["Status"] not in status:
+            continue
+        if card == "Active incidents" and r["Status"] in ("Completed", "Resolved", "Closed", "Information only"):
+            continue
+        if card == "P1 critical" and r["Priority"] != "P1":
+            continue
+        if card == "P2 urgent" and r["Priority"] != "P2":
+            continue
+        if card == "Units dispatched" and r["Status"] not in ("Units en route", "On scene"):
+            continue
+        if card == "Resolved" and r["Status"] not in ("Resolved", "Closed"):
+            continue
+        if card == "Awaiting assignment" and r["Status"] not in ("Verifying location", "Awaiting assignment",
+                                                                 "Awaiting approval", "Intake"):
+            continue
+        out.append(r)
+    out.sort(key=lambda r: (r["_lvl"], -r["_t"]) if sort == "Priority" else (r["Status"], -r["_t"]) if sort == "Status"
+             else (-r["_t"],))
+    return out
+
+
+def incident_details_html(c_: dict, p: dict, show_pii: bool) -> str:
+    """The incident record in three sections, with the source of every value marked."""
+    sl = c_["slots"]
+    stt, col = incident_status(c_)
+    created = c_.get("created", c_["started"])
+    geo = sl.get("geo")
+    loc_state = {"one": "Found on the map", "many": "Several possible matches", "none": "Not found on the map",
+                 "unavailable": "Map service unreachable"}.get(sl.get("geo_state"), "Not checked")
+    verified = ("Confirmed by the caller" + (" and matched on the map" if geo else ", but not found on the map")
+                if sl.get("location_ok") else "NOT CONFIRMED — do not dispatch on this alone")
+    danger = [lbl for key, val, lbl in [("breathing", False, "not breathing"), ("trapped", True, "trapped"),
+                                        ("bleeding", True, "heavy bleeding"), ("spreading", True, "fire spreading"),
+                                        ("weapon", True, "weapon reported"), ("caller_safe", False, "caller not safe"),
+                                        ("touching_wire", True, "someone touching a live wire")] if sl.get(key) is val]
+    safe = [lbl for key, val, lbl in [("breathing", True, "breathing"), ("bleeding", False, "no heavy bleeding"),
+                                      ("trapped", False, "nobody trapped"), ("caller_safe", True, "caller safe"),
+                                      ("weapon", False, "no weapon")] if sl.get(key) is val]
+    rows_over = [
+        ("Incident ID", f"<b>{esc(c_['ref'])}</b>" + prov("system")),
+        ("Call reference", esc(c_.get("record") or "—") + prov("system")),
+        ("Category", esc(", ".join(PROBLEMS[x]["label"] for x in sl.get("problems", [])) or "not yet classified")
+         + prov("ai" if c_.get("ai_label") else "system")),
+        ("Incident", esc(incident_label(c_)) + prov("ai" if c_.get("ai_label") else "system")),
+        ("Priority", prio_badge(c_.get("level")) + (f" <span class='muted'>{esc(LEVELS[c_['level']][1])}</span>"
+                                                    if c_.get("level") else "")),
+        ("Status", status_badge(stt, col)),
+        ("Received", esc(ist_stamp(created)) + prov("system")),
+        ("Certainty", esc({"reported": "Reported by the caller", "suspected": "Suspected, not confirmed",
+                           "question": "A question, not a report", "hypothetical": "Hypothetical"}
+                          .get(c_.get("certainty"), "—"))),
+        ("Description", esc(describe(c_)) + prov("ai")),
+        ("Caller's own words", f"“{esc(c_.get('original', '') or '—')}”" + prov("caller")),
+    ]
+    rows_loc = [
+        ("Location as given", esc(sl.get("location") or "not given") + prov("caller" if sl.get("location") else "none")),
+        ("Search query used", esc(sl.get("location_query") or "—") + prov("ai")),
+        ("Map match", esc((geo or {}).get("name", "—")) + prov("system")),
+        ("Coordinates", (f"{geo['lat']:.5f}, {geo['lon']:.5f}" if geo else "not available") + prov("system")),
+        ("Map lookup", esc(loc_state) + (" · area level, not the exact spot" if sl.get("geo_level") == "area" else "")),
+        ("Verification", (status_badge("Verified", "green") if sl.get("location_ok") else status_badge("Unverified", "amber"))
+         + f" <span class='muted'>{esc(verified)}</span>"),
+    ]
+    rows_caller = [
+        ("Caller", esc(sl.get("name") or "not given") + prov("caller" if sl.get("name") else "none")),
+        ("Call-back number", esc(mask_phone(sl.get("phone"), show_pii))
+         + prov("system" if sl.get("phone_src") == "ANI" else "caller")
+         + ("" if show_pii else " <span class='muted'>masked for your role</span>")),
+        ("People affected", esc(str(sl.get("people") or "not stated"))
+         + prov(sl.get("people_src") == "caller" and "caller" or ("ai" if sl.get("people") else "none"))),
+        ("Danger signs", ("".join(f"<span class='badge c-red'>⚠ {esc(x)}</span> " for x in danger) or "")
+         + ("".join(f"<span class='badge c-green'>● {esc(x)}</span> " for x in safe) or "")
+         or "<span class='muted'>none established yet</span>"),
+        ("Escalation", esc("; ".join(c_.get("escalated", [])) or "not needed so far")),
+        ("Resolution", (f"Resolved {esc(ist_stamp(c_['resolved_at']))} by {esc(c_.get('resolved_by', ''))}"
+                        if c_.get("resolved_at") else "open")
+         + (f" · closed {esc(ist_stamp(c_['closed_at']))}" if c_.get("closed_at") else "")),
+    ]
+
+    def block(title, rows):
+        return (f"<div class='panel'><div class='sec'>{title}</div><div class='kv'>"
+                + "".join(f"<span>{k}</span><span>{v}</span>" for k, v in rows) + "</div></div>")
+    legend = ("<div class='muted' style='font-size:.76em;margin-top:2px'>Source of each value: "
+              + prov("caller") + " said by the caller · " + prov("ai") + " extracted by AI, not confirmed · "
+              + prov("system") + " recorded by the system · " + prov("dispatcher") + " set by a dispatcher.</div>")
+    return ("<div class='cc'><div class='grid2'>" + block("Incident overview", rows_over)
+            + block("Location information", rows_loc) + block("Caller information", rows_caller)
+            + "</div>" + legend + "</div>")
+
+
+def resources_html(incs: list[dict], p: dict) -> str:
+    """Department-wise resource cards: how many units each agency has, and what they are doing."""
+    busy = {}
+    for c_ in incs:
+        for a_ in c_.get("assignments", []):
+            if a_.get("unit") and not a_.get("cancelled"):
+                busy[a_["unit"]] = (c_["ref"], unit_state(a_)[0])
+    cards = []
+    for dept, info in DEPARTMENTS.items():
+        fleet = info["fleet"]
+        units = [v for v in VEHICLES if fleet and v["Type"] == fleet]
+        tickets = [a_ for c_ in incs for a_ in c_.get("assignments", []) if a_["dept"] == dept and a_.get("ticket")]
+        states = [busy.get(v["Vehicle ID"], (None, "Available"))[1] for v in units]
+        avail = sum(1 for s in states if s == "Available")
+        enroute = sum(1 for s in states if s in ("Dispatched", "En route"))
+        onscene = sum(1 for s in states if s in ("On scene", "Transporting"))
+        done = sum(1 for s in states if s == "Completed")
+        rows = "".join(
+            f"<div class='j'><b>{esc(v['Vehicle ID'])}</b> {esc(v['Type'])}"
+            f"<em class='{'ok' if busy.get(v['Vehicle ID']) else ''}'>{esc(busy.get(v['Vehicle ID'], (None, 'Available'))[1])}</em>"
+            + (f"<br><span class='muted'>{esc(busy[v['Vehicle ID']][0])}</span>" if v["Vehicle ID"] in busy else "")
+            + "</div>" for v in units)
+        body = (f"<div class='nums'><div><b>{len(units)}</b><span>Units</span></div>"
+                f"<div><b>{avail}</b><span>Available</span></div><div><b>{enroute}</b><span>En route</span></div>"
+                f"<div><b>{onscene + done}</b><span>On scene / done</span></div></div>" + rows) if units else \
+               (f"<div class='muted' style='font-size:.85em'>No vehicles: this agency is reached by phone. "
+                f"{len(tickets)} call-back ticket(s) so far.</div>")
+        cards.append(f"<div class='panel rescard'><div class='hd'><span class='ic'>{info['icon']}</span><b>{esc(dept)}</b></div>"
+                     f"<div class='muted' style='font-size:.78em;margin-top:-4px'>{esc(info['agency'])} · ☎ {esc(info['lines'])}</div>"
+                     + body + "</div>")
+    return "<div class='cc'><div class='res'>" + "".join(cards) + "</div></div>"
+
+
+def timeline_html(c_: dict, p: dict, newest_first: bool = False, types: list | None = None,
+                  limit: int | None = None) -> str:
+    ev = sorted(c_.get("audit", []), key=lambda e: (e["ts"], e["id"]), reverse=newest_first)
+    if types:
+        ev = [e for e in ev if e["type"] in types]
+    if limit:
+        ev = ev[:limit] if newest_first else ev[-limit:]
     rows = []
     for e in ev:
         det = (f"<details><summary>details</summary><div class='muted'>Event {esc(e['id'])} · {ist_stamp(e['ts'])} · "
                f"{esc(e.get('details') or e['text'])}</div></details>" if p["timeline"] == "Detailed" else "")
         stt = f" {status_badge(e['status'], {'Dispatched': 'blue', 'On scene': 'green', 'Transporting': 'orange', 'Completed': 'done', 'Cancelled': 'muted', 'Recommended': 'gray', 'Approved': 'blue', 'Verified': 'green', 'Closed': 'done', 'Attention': 'red'}.get(e['status'], 'gray'))}" if e.get("status") else ""
-        rows.append(f"<div class='ev'><time>{ist_time(e['ts'])}</time><span>{e['icon']}</span><div><span class='t'>{esc(e['type'])}</span>{stt}"
+        crit = " style='border-left:3px solid var(--red);padding-left:8px'" if e["type"] in CRITICAL_EVENTS else ""
+        rows.append(f"<div class='ev'{crit}><time>{ist_time(e['ts'])}</time><span>{e['icon']}</span><div><span class='t'>{esc(e['type'])}</span>{stt}"
                     f"{(' · <b>' + esc(e['unit']) + '</b>') if e.get('unit') else ''}<div>{esc(e['text'])}</div>"
                     f"<div class='a'>by {esc(e['actor'])}</div>{det}</div></div>")
     return "<div class='cc'><div class='panel tl2'>" + ("".join(rows) or "<div class='muted'>No events yet.</div>") + "</div></div>"
@@ -3716,7 +3916,7 @@ def agencies_html(c_: dict, p: dict) -> str:
     return "<div class='cc'><div class='ag'>" + "".join(cards) + "</div></div>"
 
 
-def india_map(incs: list[dict], selected: str | None, p: dict, center=None):
+def india_map(incs: list[dict], selected: str | None, p: dict, center=None, fit: bool = False):
     """Interactive India map: verified incident locations only (unit GPS is not available in this demo)."""
     tiles = basemap_layers()
     sel = next((c_ for c_ in incs if c_["ref"] == selected), None)
@@ -3741,6 +3941,13 @@ def india_map(incs: list[dict], selected: str | None, p: dict, center=None):
                             tooltip=tip, popup=folium.Popup(f"<b>{esc(c_['ref'])}</b><br>{esc(incident_label(c_))}<br>{lab} · "
                                                             f"{esc(incident_status(c_)[0])}<br>{esc(g['name'][:90])}", max_width=260)).add_to(fg)
     fg.add_to(m)
+    if fit:                                              # zoom out to every verified incident at once
+        pts = [(c_["slots"]["geo"]["lat"], c_["slots"]["geo"]["lon"]) for c_ in incs
+               if c_["slots"].get("geo") and c_["slots"].get("location_ok")]
+        if len(pts) > 1:
+            m.fit_bounds(pts, padding=(30, 30))
+        elif pts:
+            m.location, m.options["zoom"] = list(pts[0]), 14
     folium.FeatureGroup(name="Response units (needs live GPS / AVL)", show=False).add_to(m)
     folium.LayerControl(collapsed=True).add_to(m)
     return m
@@ -3795,8 +4002,9 @@ def settings_panel(p: dict) -> None:
 
 st.session_state.used_vehicle_ids = cad_store()["used_units"]     # one fleet for every session
 
-tab_cc, tab_call, tab_dept, tab_ops, tab_acc = st.tabs(["Command Center", "Emergency call", "Departments & agencies",
-                                                        "Operations & reports", "Accuracy & observability"])
+tab_cc, tab_call, tab_inc, tab_dept, tab_ops, tab_acc, tab_admin = st.tabs(
+    ["🖥️ Command Center", "📞 Emergency Call", "📋 Incident Management", "🚓 Departments & Resources",
+     "📈 Operations & Reports", "🎯 Accuracy & Observability", "⚙️ Settings & Administration"])
 
 
 with tab_cc:
@@ -3816,7 +4024,7 @@ with tab_cc:
         awaiting = sum(1 for c_ in incs_now for a_ in c_.get("assignments", []) if a_.get("approval") == "awaiting")
         escal = [c_ for c_ in incs_now if c_.get("escalated") and incident_status(c_)[0] != "Completed"]
 
-        t1, t2, t3 = st.columns([6, 1.1, 1.1])
+        t1, t2 = st.columns([7, 1.2])
         with t1:
             @st.fragment(run_every=1.0)
             def top_bar() -> None:
@@ -3837,11 +4045,9 @@ with tab_cc:
                 st.markdown(f"⚠️ **{c_['ref']}**: {'; '.join(c_['escalated'])}")
             if not awaiting and not escal:
                 st.caption("Nothing needs attention.")
-        with t3.popover("⚙️ Settings"):
-            settings_panel(P_)
         if not pin:
-            st.caption(f"{APP_ENV} mode: open access. Set DISPATCHER_PIN in Secrets to restrict this page to dispatchers. "
-                       "All incidents come from calls made in this app; nothing is invented.")
+            st.caption(f"{APP_ENV} mode: open access · dashboard, roles and data controls are in "
+                       "**⚙️ Settings & Administration** · every incident below comes from a call made in this app.")
 
         @st.fragment(run_every=float(P_["refresh"]))
         def live_board() -> None:
@@ -3858,39 +4064,25 @@ with tab_cc:
                     st.audio(beep_wav(), format="audio/wav", autoplay=True)
             k = kpis(incs)
             if "Overview" in p["sections"] and p["cards"]:
-                cols = st.columns(len(p["cards"]))
-                for col, name in zip(cols, p["cards"]):
-                    flt = st.session_state.get("cc_filter")
-                    if col.button(f"**{k[name]}**\n{name}" + (" ✓" if flt == name else ""), key=f"kpi_{name.replace(' ', '_')}",
-                                  width="stretch", help="Filter the incident queue"):
-                        st.session_state.cc_filter = None if flt == name else name
-                        st.rerun(scope="fragment")
+                names = [n for n in p["cards"] if n in k]
+                flt = st.session_state.get("cc_filter")
+                for row_start in range(0, len(names), 4):          # four per row: wide enough never to wrap or overlap
+                    cols = st.columns(4)
+                    for col, name in zip(cols, names[row_start:row_start + 4]):
+                        on = flt == name
+                        if col.button(f"**{k[name]}**\n{('● ' if on else '') + name}", key=f"kpi_{name.replace(' ', '_')}",
+                                      width="stretch", type="primary" if on else "secondary",
+                                      help=KPI_HELP.get(name, "") + ("  \n*Selected: the queue below is filtered.*" if on
+                                                                     else "  \n*Click to filter the queue.*")):
+                            st.session_state.cc_filter = None if on else name
+                            st.rerun()          # full rerun: the queue, map and details all follow the same filter
             if "Queue" in p["sections"]:
                 f1, f2, f3, f4 = st.columns([2.2, 1.3, 1.3, 1.2])
                 q = f1.text_input("Search", placeholder="ID, incident, place, unit…", key="cc_q", label_visibility="collapsed")
                 fp = f2.multiselect("Priority", ["P1", "P2", "P3", "P4"], key="cc_fp", placeholder="Priority", label_visibility="collapsed")
-                fs = f3.multiselect("Status", ["Intake", "Verifying location", "Awaiting assignment", "Awaiting approval", "Units en route",
-                                               "On scene", "Completed", "Information only"], key="cc_fs", placeholder="Status",
-                                    label_visibility="collapsed")
+                fs = f3.multiselect("Status", QUEUE_STATUSES, key="cc_fs", placeholder="Status", label_visibility="collapsed")
                 srt = f4.selectbox("Sort", ["Newest", "Priority", "Status"], key="cc_sort", label_visibility="collapsed")
-                rows = []
-                for c_ in incs:
-                    stt = incident_status(c_)[0]
-                    lab = PRIO_STYLE[c_["level"]][0] if c_.get("level") else "—"
-                    units_ = ", ".join(a_.get("unit") or a_.get("ticket") or a_["dept"] for a_ in c_.get("assignments", []) if not a_.get("cancelled"))
-                    rows.append({"ID": c_["ref"], "Incident": incident_label(c_), "Priority": lab,
-                                 "Location": (c_["slots"].get("location") or "—") + ("" if c_["slots"].get("location_ok") else " (unverified)"),
-                                 "Received": ist_time(c_.get("created", c_["started"])), "Status": stt, "Assigned": units_ or "—",
-                                 "_lvl": "EDCBAO".index(c_["level"]) if c_.get("level") else 9, "_t": c_.get("created", 0)})
-                flt = st.session_state.get("cc_filter")
-                rows = [r for r in rows if (not q or q.lower() in " ".join(str(v) for v in r.values()).lower())
-                        and (not fp or r["Priority"] in fp) and (not fs or r["Status"] in fs)
-                        and (flt in (None, "Active incidents", "Units available", "Average response")
-                             or (flt == "P1 critical" and r["Priority"] == "P1") or (flt == "P2 urgent" and r["Priority"] == "P2")
-                             or (flt == "Units dispatched" and r["Status"] in ("Units en route", "On scene"))
-                             or (flt == "Awaiting assignment" and r["Status"] in ("Verifying location", "Awaiting assignment", "Awaiting approval", "Intake")))
-                        and (flt != "Active incidents" or r["Status"] not in ("Completed", "Information only"))]
-                rows.sort(key=lambda r: (r["_lvl"], -r["_t"]) if srt == "Priority" else (r["Status"], -r["_t"]) if srt == "Status" else (-r["_t"],))
+                rows = filter_queue(queue_rows(incs), q, fp, fs, st.session_state.get("cc_filter"), srt)
                 if rows:
                     df_ = pd.DataFrame(rows)[[c for c in p["columns"] if c in rows[0]]]
                     ev_ = st.dataframe(df_, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
@@ -3975,7 +4167,14 @@ with tab_cc:
                     st.warning("The map needs the folium and streamlit-folium packages (see requirements.txt).")
                 else:
                     sel_ref = st.session_state.get("cc_sel")
-                    out_ = st_folium(india_map(incs_m, sel_ref, P_, st.session_state.get("cc_center")), key="cc_map", height=470,
+                    mc1, mc2 = st.columns([1, 1])
+                    fit_ = mc1.toggle("Fit to all incidents", key="cc_fit",
+                                      help="Zoom out so every verified incident is on screen.")
+                    if mc2.button("Centre on selected", key="cc_centre", width="stretch"):
+                        st.session_state.cc_center = None
+                        st.rerun()
+                    out_ = st_folium(india_map(incs_m, sel_ref, P_, st.session_state.get("cc_center"), fit=fit_),
+                                     key="cc_map", height=470,
                                      use_container_width=True, returned_objects=["last_object_clicked_tooltip"])
                     tip = (out_ or {}).get("last_object_clicked_tooltip")
                     if tip and tip.split(" · ")[0] != sel_ref and st.session_state.get("cc_last_tip") != tip:
@@ -4288,6 +4487,14 @@ def unit_status(a_: dict) -> tuple[str, str]:
 
 with tab_dept:
     st.markdown(DEPT_CSS, unsafe_allow_html=True)
+    st.markdown(cc_css(cc_prefs()), unsafe_allow_html=True)
+    st.markdown("#### Resources by department")
+    _incs_d = all_incidents()
+    st.markdown(resources_html(_incs_d, cc_prefs()), unsafe_allow_html=True)
+    with st.expander("Every response resource (table)"):
+        st.dataframe(fleet_table(_incs_d), hide_index=True, width="stretch")
+        st.caption("A simulated fleet on the demo road grid. Live availability needs a real AVL/GPS feed.")
+    st.markdown("#### How a call reaches the right team")
     st.markdown("<div class='dh'><div><b>🇮🇳 ERSS-112: how a call reaches the right team</b>"
                 "<p>One number for every emergency. Each agent does one job and passes the call on. The triage and router agents are "
                 "constrained to fixed lists, the CAD sets the priority and the units, and anything unclear goes to a human supervisor.</p></div></div>",
@@ -4587,13 +4794,139 @@ with tab_ops:
             st.dataframe(du, hide_index=True, width="stretch")
             st.caption("Every unit here is a **simulated** dispatch on the demo road grid. No real agency was contacted.")
 
-    st.markdown("---")
-    if can("admin", P_OPS):
-        with st.expander("Administration"):
-            st.caption("Clears every incident, call, unit assignment and agent trace held on this server. "
-                       "Synthetic data only, but it affects every session using this app.")
-            if st.checkbox("I understand this clears all demo data", key="ops_reset_ok") and \
-                    st.button("Reset all demo data", key="ops_reset"):
+    st.caption("Filters, roles and data controls live in **⚙️ Settings & Administration**.")
+
+with tab_inc:
+    P_IM = cc_prefs()
+    st.markdown(cc_css(P_IM), unsafe_allow_html=True)
+    st.subheader("Incident management")
+    incs_im = all_incidents()
+    if not incs_im:
+        st.info("No incidents yet. They are created from the **📞 Emergency Call** module and appear here immediately.")
+    else:
+        rows_all = queue_rows(incs_im)
+        g1, g2, g3, g4, g5 = st.columns([2.2, 1.1, 1.4, 1.4, 1.1])
+        q_im = g1.text_input("Search", key="im_q", label_visibility="collapsed",
+                             placeholder="Incident ID, type, location or assigned unit…")
+        pr_im = g2.multiselect("Priority", ["P1", "P2", "P3", "P4"], key="im_prio", placeholder="Priority",
+                               label_visibility="collapsed")
+        st_im = g3.multiselect("Status", QUEUE_STATUSES, key="im_status", placeholder="Status", label_visibility="collapsed")
+        dp_im = g4.multiselect("Department", list(DEPARTMENTS), key="im_dept", placeholder="Department",
+                               label_visibility="collapsed")
+        sr_im = g5.selectbox("Sort", ["Newest", "Priority", "Status"], key="im_sort", label_visibility="collapsed")
+        h1, h2, h3 = st.columns([1.6, 1, 1])
+        dates_im = sorted({ist_date(c_.get("created", c_["started"])) for c_ in incs_im}, reverse=True)
+        dt_im = h1.multiselect("Date", dates_im, key="im_date", placeholder="Any date", label_visibility="collapsed")
+        page_size = h2.selectbox("Rows per page", [10, 25, 50], key="im_pz", label_visibility="collapsed",
+                                 format_func=lambda n: f"{n} per page")
+        rows_im = filter_queue(rows_all, q_im, pr_im, st_im, None, sr_im)
+        by_ref = {c_["ref"]: c_ for c_ in incs_im}
+        if dp_im:
+            rows_im = [r for r in rows_im
+                       if any(a_["dept"] in dp_im for a_ in by_ref[r["ID"]].get("assignments", []))]
+        if dt_im:
+            rows_im = [r for r in rows_im if ist_date(by_ref[r["ID"]].get("created", by_ref[r["ID"]]["started"])) in dt_im]
+        pages = max(1, -(-len(rows_im) // page_size))
+        page = h3.number_input("Page", 1, pages, 1, key="im_page", label_visibility="collapsed")
+        view = rows_im[(int(page) - 1) * page_size:int(page) * page_size]
+        st.caption(f"{len(rows_im)} of {len(rows_all)} incidents · page {int(page)} of {pages}")
+        if not view:
+            st.info("No incident matches these filters. Clear a filter to see more.")
+        else:
+            df_im = pd.DataFrame([{"!": "⚠" if r["Priority"] == "P1" else ("▲" if r["Priority"] == "P2" else ""),
+                                   "Incident ID": r["ID"], "Incident type": r["Incident"], "Priority": r["Priority"],
+                                   "Location": r["Location"], "Received": r["Received"], "Status": r["Status"],
+                                   "Assigned units": r["Assigned"]} for r in view])
+            ev_im = st.dataframe(df_im, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+                                 key="im_table", height=min(36 * (len(df_im) + 1) + 6, 420),
+                                 column_config={"!": st.column_config.TextColumn("!", width="small",
+                                                                                 help="⚠ P1 critical · ▲ P2 urgent"),
+                                                "Incident type": st.column_config.TextColumn("Incident type", width="medium")})
+            picked = ev_im.selection.rows if ev_im and hasattr(ev_im, "selection") else []
+            o1, o2 = st.columns([2, 1])
+            choice_im = o1.selectbox("Open incident", [r["ID"] for r in view],
+                                     index=[r["ID"] for r in view].index(st.session_state["cc_sel"])
+                                     if st.session_state.get("cc_sel") in [r["ID"] for r in view] else 0,
+                                     key="im_pick", label_visibility="collapsed")
+            if picked:
+                choice_im = df_im.iloc[picked[0]]["Incident ID"]
+            if o2.button("View details", type="primary", key="im_view", width="stretch") or picked:
+                if st.session_state.get("cc_sel") != choice_im:
+                    st.session_state.cc_sel = choice_im               # the Command Center map follows the same selection
+                    st.rerun()
+                st.session_state.cc_sel = choice_im
+
+        sel_im = by_ref.get(st.session_state.get("cc_sel") or "")
+        if sel_im is not None:
+            st.markdown(f"#### Incident {sel_im['ref']}")
+            st.markdown(incident_details_html(sel_im, P_IM, can("pii", P_IM)), unsafe_allow_html=True)
+            if not can("pii", P_IM):
+                st.caption("🔒 " + role_note("pii", P_IM))
+            st.markdown("##### Assigned resources")
+            du_im = unit_table([sel_im])
+            if len(du_im):
+                st.dataframe(du_im.drop(columns=["Incident ID"]), hide_index=True, width="stretch")
+                st.caption("Recommended by the CAD run card, approved by a human (or by the demo's auto-approval). "
+                           "Every dispatch here is simulated.")
+            else:
+                st.info("No units yet. The CAD recommends units once the caller's location is confirmed.")
+            st.markdown("##### Activity timeline and audit trail")
+            t1_, t2_, t3_ = st.columns([1.1, 2.4, 1.2])
+            newest = t1_.toggle("Newest first", key="im_tl_order")
+            kinds = sorted({e["type"] for e in sel_im.get("audit", [])})
+            pick_k = t2_.multiselect("Event type", kinds, key="im_tl_types", placeholder="All event types",
+                                     label_visibility="collapsed")
+            only_crit = t3_.toggle("Critical only", key="im_tl_crit", help="Escalations, priority changes, "
+                                                                          "cancellations, resolution and closure.")
+            types_ = [k for k in (pick_k or kinds) if (k in CRITICAL_EVENTS or not only_crit)]
+            st.markdown(timeline_html(sel_im, P_IM, newest_first=newest, types=types_), unsafe_allow_html=True)
+            if sel_im.get("audit") and can("dispatch", P_IM):
+                st.download_button(f"Export audit trail of {sel_im['ref']} (CSV)",
+                                   pd.DataFrame([{k: v for k, v in e.items() if k != "icon"} | {"Time": ist_stamp(e["ts"])}
+                                                 for e in sel_im["audit"]]).drop(columns=["ts"]).to_csv(index=False).encode("utf-8"),
+                                   f"audit_{sel_im['ref']}.csv", "text/csv", key="im_audit_dl")
+            st.caption("Approving, cancelling, resolving and closing are done in **🖥️ Command Center → CAD decision**, "
+                       "so there is one place where dispatch decisions are made and recorded.")
+
+
+with tab_admin:
+    P_AD = cc_prefs()
+    st.markdown(cc_css(P_AD), unsafe_allow_html=True)
+    st.subheader("Settings & administration")
+    s1, s2 = st.columns([1.25, 1], gap="large")
+    with s1:
+        settings_panel(P_AD)
+    with s2:
+        st.markdown("**Access and roles**")
+        st.dataframe(pd.DataFrame([{"Role": r_, "May": ", ".join(sorted(RIGHT_NAMES.get(x, x) for x in rights)) or "view only",
+                                    "Signed in": "✓" if r_ == P_AD["role"] else ""}
+                                   for r_, rights in ROLE_RIGHTS.items()]), hide_index=True, width="stretch")
+        st.caption("Role-based access control decides what each role may do. This prototype does not verify who the "
+                   "person is: put it behind your control room's own sign-in before any real use.")
+        st.markdown("**Keys and services**")
+        st.dataframe(pd.DataFrame([
+            {"Service": "Groq (AI triage & routing)", "Configured": "Yes" if groq_key else "No",
+             "Where": "Secrets → GROQ_API_KEY"},
+            {"Service": "CARTO base maps", "Configured": "Yes" if CARTO_KEY else "No (OpenStreetMap fallback)",
+             "Where": "Secrets → CARTO_API_KEY"},
+            {"Service": "LangSmith tracing", "Configured": "Yes" if ls_client else "No",
+             "Where": "Secrets → LANGSMITH_API_KEY"},
+            {"Service": "Dispatcher PIN", "Configured": "Yes" if _secret("DISPATCHER_PIN") else "No",
+             "Where": "Secrets → DISPATCHER_PIN"},
+        ]), hide_index=True, width="stretch")
+        st.caption("Keys are read from Streamlit Secrets or the environment only; they are never typed into the page "
+                   "and never shown here.")
+        st.markdown("**Privacy and retention**")
+        st.markdown("- Caller numbers are masked for roles without the *see unmasked caller details* right.\n"
+                    "- Incidents, transcripts and recordings live in server memory only and are lost when the app "
+                    "restarts; there is no database and no export of caller audio.\n"
+                    "- All data in this prototype is synthetic. Do not enter real caller information.")
+        if can("admin", P_AD):
+            st.markdown("**Administration**")
+            st.caption("Clears every incident, call, unit assignment and agent trace on this server. It affects every "
+                       "session using this app.")
+            ok_rst = st.checkbox("I understand this clears all demo data", key="ad_reset_ok")
+            if st.button("Reset all demo data", key="ad_reset", disabled=not ok_rst):
                 store_ = cad_store()
                 store_["incidents"].clear()
                 store_["used_units"].clear()
@@ -4603,9 +4936,9 @@ with tab_ops:
                 st.session_state.call = None
                 st.session_state.cc_sel = None
                 st.rerun()
-    else:
-        st.caption("Administration (resetting demo data) is open to the Shift Supervisor and Administrator roles. "
-                   f"You are signed in as **{P_OPS['role']}**; change it in Command Center → ⚙️ Settings.")
+        else:
+            st.caption("🔒 " + role_note("admin", P_AD))
+
 
 st.divider()
 st.caption("Audit note: every incident keeps an append-only trail of who decided what — AI classification, CAD "
